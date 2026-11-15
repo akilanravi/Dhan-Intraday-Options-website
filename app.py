@@ -19,7 +19,8 @@ from worker_store import cloud_journal, enabled
 st.set_page_config(page_title='DHAN QUANT · INTRADAY',layout='wide',page_icon='📈')
 st.markdown('''<style>
 .stApp{background:linear-gradient(145deg,#060b17,#101d35);color:#e9f3ff}
-h1,h2,h3{color:#eaf4ff!important}p,label,.stMarkdown{color:#d6e6ff}
+h2,h3{color:#eaf4ff!important}p,label,.stMarkdown{color:#d6e6ff}
+h1{background:linear-gradient(90deg,#6ee7ff,#b69bff,#ff76c7);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
 [data-testid="stMetric"]{background:#10223c;border:1px solid #2b4769;border-radius:16px;padding:14px}
 [data-testid="stMetricValue"]{color:#4be4ff}
 .stButton button{background:linear-gradient(100deg,#1459d9,#8742c6);color:white;border-radius:11px}
@@ -52,10 +53,6 @@ if not token or not client:
 try: all_u=universe()
 except Exception as e:st.error(f'Dhan instrument master error: {e}');st.stop()
 options=all_u.symbol.astype(str).tolist()
-scope=st.radio('Scan scope',('Watchlist','All F&O and indices'),horizontal=True)
-watchlist=st.multiselect('Scan F&O stocks and indices',options,default=[s for s in ['NIFTY','BANKNIFTY','RELIANCE','HDFCBANK'] if s in options])
-selected=options if scope=='All F&O and indices' else watchlist
-st.caption(f'{len(selected)} selected · Use Watchlist for quicker checks. Full-universe scans are paced to Dhan limits.')
 ss=st.session_state
 for key,value in {'results':[],'candles':{},'messages':[],'future':None,'checked':0.0,
                   'last_scan':'','scan_queue':None,'scan_progress':None,'scan_total':0,'dirty':False,'journal_error':'','gist_id':secrets.get('INTRADAY_GIST_ID','')}.items():
@@ -70,7 +67,11 @@ if 'journal' not in ss and not worker_mode:
 
 @st.fragment(run_every=3)
 def dashboard():
-    """Paint current data immediately. Submit/poll network work off the UI thread."""
+    """Render scanner controls and poll its background worker."""
+    scope=st.radio('Scan scope',('Watchlist','All F&O and indices'),horizontal=True)
+    watchlist=st.multiselect('Scan F&O stocks and indices',options,default=[s for s in ['NIFTY','BANKNIFTY','RELIANCE','HDFCBANK'] if s in options])
+    selected=options if scope=='All F&O and indices' else watchlist
+    st.caption(f'{len(selected)} selected · Use Watchlist for quicker checks. Full-universe scans are paced to Dhan limits.')
     if worker_mode and time.monotonic()-ss.get('cloud_checked',-1000)>=15:
         ss.cloud_checked=time.monotonic()
         try:
@@ -126,7 +127,7 @@ def dashboard():
         status=ss.get('worker_status',{})
         st.caption(f"Worker owns paper trading · Last worker check: {status.get('checked_at','not reported')} · {status.get('state','waiting')}")
         if status.get('notes'):st.caption(status['notes'][-1])
-    render_dashboard()
+    render_dashboard(0)
 
 BIAS_COLORS = {
     'Bullish': ('#75f0bd', '#103b32'),
@@ -190,18 +191,17 @@ def scanner_style(df):
     return styled_table(df,[(['Side','Setup bias'],df['Setup bias'])]+
                         [([name],df[name].map(checks)) for name in CHECKS])
 
-def render_dashboard():
+def render_dashboard(tab):
     r=st.session_state.results;j=st.session_state.journal
-    m1,m2,m3,m4=st.columns(4)
-    m1.metric('Scanned symbols',len(set(x['symbol'] for x in r)))
-    m2.metric('Eligible CE',sum(x['eligible'] and x['side']=='CE' and fresh_candle(x['candle'],datetime.now(IST)) for x in r))
-    m3.metric('Eligible PE',sum(x['eligible'] and x['side']=='PE' and fresh_candle(x['candle'],datetime.now(IST)) for x in r))
-    m4.metric('Open paper trades',0 if j.empty else int((j.status=='OPEN').sum()))
-    if ss.messages:
-        with st.expander('Scan and paper-trading diagnostics', expanded=not r):
-            for msg in ss.messages:st.write(msg)
-    tabs=st.tabs(['1 · Market scanner','2 · Eligible signal cards','3 · Trade analysis','4 · Paper trading','5 · Conditions','6 · Trade Decision'])
-    with tabs[0]:
+    if tab == 0:
+        m1,m2,m3,m4=st.columns(4)
+        m1.metric('Scanned symbols',len(set(x['symbol'] for x in r)))
+        m2.metric('Eligible CE',sum(x['eligible'] and x['side']=='CE' and fresh_candle(x['candle'],datetime.now(IST)) for x in r))
+        m3.metric('Eligible PE',sum(x['eligible'] and x['side']=='PE' and fresh_candle(x['candle'],datetime.now(IST)) for x in r))
+        m4.metric('Open paper trades',0 if j.empty else int((j.status=='OPEN').sum()))
+        if ss.messages:
+            with st.expander('Scan and paper-trading diagnostics', expanded=not r):
+                for msg in ss.messages:st.write(msg)
         st.subheader('Intraday 5-minute scanner')
         if r:
             df=scan_frame(r).sort_values(['Qualified on candle','Score','Symbol'],ascending=[False,False,True])
@@ -218,7 +218,7 @@ def render_dashboard():
                                             'Close':st.column_config.NumberColumn(format='%.2f')})
             st.download_button('Download scanner CSV (both sides)',df.to_csv(index=False),'intraday_scanner.csv')
         else:st.info('Select instruments and click REFRESH.')
-    with tabs[1]:
+    if tab == 1:
         st.subheader('Eligible CE / PE signals')
         card_side=st.radio('Signal cards side',('CE · Bullish','PE · Bearish'),horizontal=True)
         now=datetime.now(IST)
@@ -237,7 +237,7 @@ def render_dashboard():
                     with st.expander('Condition checklist'):
                         for name, value in x['tests'].items():
                             st.write(('✅' if value is True else '❌' if value is False else '🟡')+' '+name)
-    with tabs[2]:
+    if tab == 2:
         st.subheader('Candles + EMA + VWAP')
         if st.session_state.candles:
             symbol=st.selectbox('Instrument',list(st.session_state.candles),key='chart_symbol')
@@ -261,7 +261,7 @@ def render_dashboard():
             st.caption(LEGEND + ' · Candles compare Close to Open. Supertrend cells show the indicator’s own direction.')
             st.dataframe(candle_table(d.tail(20)),use_container_width=True)
         else:st.info('Scan first to view candles.')
-    with tabs[3]:
+    if tab == 3:
         st.subheader('Automatic paper journal')
         st.caption('Entry at Dhan ask, exits at observed Dhan bid. Prices are snapshots. Missed SL/target between refreshes cannot be reconstructed.')
         if j.empty:st.info('No paper trades yet.')
@@ -276,7 +276,7 @@ def render_dashboard():
         if secrets.get('GITHUB_TOKEN') and ss.gist_id and not secrets.get('INTRADAY_GIST_ID'):
             st.warning(f'Add this journal ID to Streamlit Secrets to reconnect after restart: INTRADAY_GIST_ID = "{ss.gist_id}"')
         if not secrets.get('GITHUB_TOKEN'):st.warning('Persistent journal is NOT configured. Local Streamlit Cloud storage is temporary. Add GITHUB_TOKEN and INTRADAY_GIST_ID.')
-    with tabs[4]:
+    if tab == 4:
         st.subheader('Conditions — green passed / red failed / yellow unverified')
         if r:
             symbol=st.selectbox('Choose instrument',sorted(set(x['symbol'] for x in r)),key='cond_symbol')
@@ -286,7 +286,7 @@ def render_dashboard():
                     st.markdown(('🟢' if v is True else '🔴' if v is False else '🟡')+' '+k+(' — not verified' if v is None else ''))
         st.caption('Combined entry requires ≥ threshold, ST(10,3), EMA9/21, VWAP, volume 1.5×, and CPR/PDH trigger. Exit: premium SL, 2R target, ST(7,2) reversal, opposing eligible signal or 15:20 IST. These are configurable research rules, not a verified profitable strategy.')
 
-    with tabs[5]:
+    if tab == 5:
         st.subheader('Intraday trade decision')
         if not r:
             st.info('Run a Market Scanner scan first.')
@@ -338,9 +338,21 @@ def render_dashboard():
                                        'End-of-day exit checks start at 15:20 IST; a valid bid is needed.'])
 
 
-home, bt = st.tabs(['Intraday dashboard','Call / Put Backtest'])
-with home:
-    dashboard()
-with bt:
-    render_backtest(all_u,token,client,DhanAPI,'5 min')
+@st.fragment(run_every=3)
+def dashboard_view(tab):
+    """Refresh live data views without rerunning the backtest widgets."""
+    render_dashboard(tab)
 
+
+tabs = st.tabs([
+    '1 · Market scanner', '2 · Eligible signal cards', '3 · Trade analysis',
+    '4 · Paper trading', '5 · Conditions', '6 · Trade Decision',
+    '7 · Call / Put Backtest',
+])
+with tabs[0]:
+    dashboard()
+for tab_index in range(1, 6):
+    with tabs[tab_index]:
+        dashboard_view(tab_index)
+with tabs[6]:
+    render_backtest(all_u, token, client, DhanAPI, '5 min')
