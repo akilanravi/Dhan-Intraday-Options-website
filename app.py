@@ -338,7 +338,7 @@ def render_dashboard():
                                        'End-of-day exit checks start at 15:20 IST; a valid bid is needed.'])
 
 
-home, bt = st.tabs(['Intraday dashboard','Underlying Backtest'])
+home, bt = st.tabs(['Intraday dashboard','Call / Put Backtest'])
 with home:
     dashboard()
 with bt:
