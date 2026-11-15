@@ -1,0 +1,4 @@
+.streamlit/secrets.toml
+__pycache__/
+intraday_paper_trades.csv
+intraday_paper_trades.tmp
