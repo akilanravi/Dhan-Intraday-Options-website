@@ -137,6 +137,29 @@ class DhanAPI:
                                      'Accept': 'application/json'})
 
     def post(self, path, payload, limiter=DATA_LIMITER, with_client=False):
+        # Optional cross-process pacing when both workers share a Dhan account on Linux.
+        lock_dir=os.environ.get('DHAN_SHARED_LIMIT_DIR')
+        if not lock_dir:return self._post(path,payload,limiter,with_client)
+        import fcntl
+        from pathlib import Path
+        root=Path(lock_dir)
+        root.mkdir(parents=True,exist_ok=True)
+        is_chain=path in ('/optionchain','/optionchain/expirylist')
+        with (root/('chain.lock' if is_chain else 'data.lock')).open('a+') as handle:
+            fcntl.flock(handle,fcntl.LOCK_EX)
+            handle.seek(0)
+            prior=float(handle.read() or '0')
+            pause=(3.25 if is_chain else .25)
+            time.sleep(max(0, min(pause, prior+pause-time.time())))
+            try:
+                return self._post(path,payload,limiter,with_client)
+            finally:
+                handle.seek(0)
+                handle.truncate()
+                handle.write(str(time.time()))
+                handle.flush()
+
+    def _post(self, path, payload, limiter=DATA_LIMITER, with_client=False):
         headers = {'client-id': self.client_id} if (with_client and self.client_id) else {}
         last = ''
         for attempt in range(4):
