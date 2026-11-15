@@ -30,15 +30,18 @@ def supertrend(d, period, multiplier):
     a = tr.ewm(alpha=1/period, adjust=False, min_periods=period).mean()
     mid = (h+l)/2
     upper,lower = mid+multiplier*a,mid-multiplier*a
-    fu,fl = upper.copy(),lower.copy()
-    direction = pd.Series(0,index=d.index,dtype=int)
+    # Preserve the recurrence exactly; NumPy arrays avoid per-bar pandas indexing.
+    hi,lo=upper.to_numpy(copy=True),lower.to_numpy(copy=True)
+    u,v=hi.copy(),lo.copy()
+    close,midv,av=c.to_numpy(),mid.to_numpy(),a.to_numpy()
+    direction=np.zeros(len(d),dtype=int)
     for i in range(1,len(d)):
-        if pd.isna(a.iloc[i]): continue
-        fu.iloc[i] = upper.iloc[i] if pd.isna(fu.iloc[i-1]) or upper.iloc[i]<fu.iloc[i-1] or c.iloc[i-1]>fu.iloc[i-1] else fu.iloc[i-1]
-        fl.iloc[i] = lower.iloc[i] if pd.isna(fl.iloc[i-1]) or lower.iloc[i]>fl.iloc[i-1] or c.iloc[i-1]<fl.iloc[i-1] else fl.iloc[i-1]
-        prior = direction.iloc[i-1]
-        direction.iloc[i] = 1 if c.iloc[i]>fu.iloc[i-1] else -1 if c.iloc[i]<fl.iloc[i-1] else (prior if prior else (1 if c.iloc[i]>mid.iloc[i] else -1))
-    return direction
+        if np.isnan(av[i]):continue
+        u[i]=hi[i] if np.isnan(u[i-1]) or hi[i]<u[i-1] or close[i-1]>u[i-1] else u[i-1]
+        v[i]=lo[i] if np.isnan(v[i-1]) or lo[i]>v[i-1] or close[i-1]<v[i-1] else v[i-1]
+        prior=direction[i-1]
+        direction[i]=1 if close[i]>u[i-1] else -1 if close[i]<v[i-1] else (prior or (1 if close[i]>midv[i] else -1))
+    return pd.Series(direction,index=d.index)
 
 
 def enrich(d):
@@ -83,7 +86,7 @@ def signal(d, symbol, threshold=7):
         tests={
           'CPR trend': bool(r.Close>r.tc if bull else r.Close<r.bc),
           'CPR breakout/retest': bool(r.break_up or r.retest_up if bull else r.break_dn or r.retest_dn),
-          'Camarilla/PDH-PDL': bool(r.Close>r.pdh if bull else r.Close<r.pdl),
+          'PDH / PDL': bool(r.Close>r.pdh if bull else r.Close<r.pdl),
           'EMA 9/21': bool(r.ema9>r.ema21 if bull else r.ema9<r.ema21),
           'VWAP': bool(r.Close>r.vwap if bull else r.Close<r.vwap),
           'RSI 14': bool(r.rsi>=55 if bull else r.rsi<=45),
@@ -93,7 +96,7 @@ def signal(d, symbol, threshold=7):
         }
         score=sum(v is True for v in tests.values())
         # Eight verifiable checks + one explicitly unavailable until NIFTY data loaded.
-        structure=tests['CPR breakout/retest'] or tests['Camarilla/PDH-PDL']
+        structure=tests['CPR breakout/retest'] or tests['PDH / PDL']
         valid=score>=threshold and tests['Supertrend 10,3'] and tests['EMA 9/21'] and tests['VWAP'] and tests['Volume 1.5x'] and structure
         results.append({'symbol':symbol,'side':side,'score':score,'max_score':8,'eligible':bool(valid),
           'close':float(r.Close),'candle':str(d.index[-1]),'tests':tests,'exit_st':int(r.st_exit),

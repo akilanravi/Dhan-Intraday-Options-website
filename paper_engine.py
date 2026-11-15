@@ -1,5 +1,7 @@
 """Dhan Intraday Options V1. Separate repository, paper-only, automatic in-session refresh."""
-import io, math, os, time
+import hashlib, io, math, os, time
+from threading import Lock
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -133,27 +135,73 @@ def worker_pool():
     return ThreadPoolExecutor(max_workers=4, thread_name_prefix='intraday')
 
 
+def completed_slot(clock):
+    t=pd.Timestamp(clock)
+    return t.floor('5min')-pd.Timedelta(minutes=5)
+
+def in_market(clock):
+    return clock.weekday()<5 and (9,15)<=(clock.hour,clock.minute)<(15,30)
+
+class CandleMemo:
+    def __init__(self):
+        self.lock=Lock()
+        self.data=OrderedDict()
+
+    def load(self, account, api, x):
+        key=(account,str(x['sid']),x['segment'],x['instrument'])
+        clock=datetime.now(IST)
+        with self.lock:
+            hit=self.data.get(key)
+            if hit is not None:
+                stamp,d=hit
+                slot=completed_slot(clock)
+                valid=(d.index[-1]==slot and stamp.date()==clock.date() if in_market(clock)
+                       else not in_market(stamp) and stamp.date()==clock.date() and
+                            (clock-stamp).total_seconds()<900)
+                if valid:
+                    self.data.move_to_end(key)
+                    return d
+        d=enrich(intraday_candles(api,x))
+        with self.lock:
+            self.data[key]=(clock,d)
+            self.data.move_to_end(key)
+            while len(self.data)>500:self.data.popitem(last=False)
+        return d
+
+_MEMO=CandleMemo()
+
 def refresh_cycle(token,client,lookup,selected,j,threshold,capital,cap,stop,target,risk,auto,store,dirty,progress=None,journal_ready=True):
     """Worker has no Streamlit UI or session-state calls."""
     api=DhanAPI(token,client)
     results=[]; candles={}; errors=[]
     blocked=False
+    account=hashlib.sha256(token.encode()).digest()
     attempted=0
     successful=0
-    def scan_symbol(symbol):
+    def fetch_symbol(symbol):
+        # Each thread owns its HTTP session; Dhan's existing limiter is shared.
+        local=DhanAPI(token,client)
+        with local.session:
+            return _MEMO.load(account,local,lookup[symbol])
+
+    def record(symbol, fetch):
         nonlocal blocked, attempted, successful
         attempted += 1
         try:
-            d=enrich(intraday_candles(api,lookup[symbol]))
-            if symbol in selected: candles[symbol]=d
-            results.extend(signal(d,symbol,threshold))
+            d=fetch()
+            rows=signal(d,symbol,threshold)
+            if symbol in selected_set:candles[symbol]=d
+            results.extend(rows)
             successful += 1
         except Exception as e:
             msg=str(e)[:230]
             errors.append(f'{symbol}: {msg}')
-            blocked=any(code in msg for code in ('DH-901','DH-902','HTTP 401','HTTP 403'))
+            blocked=blocked or any(code in msg for code in ('DH-901','DH-902','HTTP 401','HTTP 403'))
         if progress is not None:
             progress.put((attempted,successful,symbol,errors[-1] if errors else ''))
+
+    def scan_symbol(symbol):
+        record(symbol, lambda: _MEMO.load(account,api,lookup[symbol]))
 
     def within_market(clock):
         return (9,15)<= (clock.hour,clock.minute) < (15,30) and clock.weekday()<5
@@ -162,6 +210,7 @@ def refresh_cycle(token,client,lookup,selected,j,threshold,capital,cap,stop,targ
     open_symbols=set() if j.empty else set(j.loc[j.status=='OPEN','symbol'])
     old=j.copy(deep=True)
     exits=[]; entries=[]
+    selected_set=set(selected)
     for symbol in sorted(open_symbols):
         scan_symbol(symbol)
         if blocked:break
@@ -172,12 +221,21 @@ def refresh_cycle(token,client,lookup,selected,j,threshold,capital,cap,stop,targ
         j,exits=update_positions(j,api,lookup,smap,stop,target,now)
     elif open_symbols and not within_market(clock):
         errors.append('Outside market hours: open paper positions are not filled using closing quotes.')
-    for symbol in selected:
-        if blocked:break
-        if symbol not in open_symbols:
-            scan_symbol(symbol)
+    remaining=[symbol for symbol in dict.fromkeys(selected) if symbol not in open_symbols]
+    if remaining and not blocked and not open_symbols:
+        scan_symbol(remaining.pop(0))  # catch credentials failures before sending a batch
+    if remaining and not blocked:
+        from concurrent.futures import as_completed
+        with ThreadPoolExecutor(max_workers=3,thread_name_prefix='dhan-candles') as pool:
+            for offset in range(0,len(remaining),3):
+                if blocked:break
+                pending={pool.submit(fetch_symbol,s):s for s in remaining[offset:offset+3]}
+                for future in as_completed(pending):
+                    record(pending[future],future.result)
     clock=datetime.now(IST)
     now=clock.isoformat(timespec='seconds')
+    priority={symbol:i for i,symbol in enumerate(dict.fromkeys([*sorted(open_symbols),*selected]))}
+    results.sort(key=lambda row:(priority.get(row['symbol'],len(priority)),row['side']))
     if within_market(clock) and journal_ready and not blocked:
         entries_map={(r['symbol'],r['side']):r for r in results if r['symbol'] in selected
                      and fresh_candle(r['candle'],clock)}

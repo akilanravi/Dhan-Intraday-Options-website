@@ -49,7 +49,10 @@ if not token or not client:
 try: all_u=universe()
 except Exception as e:st.error(f'Dhan instrument master error: {e}');st.stop()
 options=all_u.symbol.astype(str).tolist()
-selected=st.multiselect('Scan F&O stocks and indices',options,default=[s for s in ['NIFTY','BANKNIFTY','RELIANCE','HDFCBANK'] if s in options])
+scope=st.radio('Scan scope',('Watchlist','All F&O and indices'),horizontal=True)
+watchlist=st.multiselect('Scan F&O stocks and indices',options,default=[s for s in ['NIFTY','BANKNIFTY','RELIANCE','HDFCBANK'] if s in options])
+selected=options if scope=='All F&O and indices' else watchlist
+st.caption(f'{len(selected)} selected · Use Watchlist for quicker checks. Full-universe scans are paced to Dhan limits.')
 ss=st.session_state
 for key,value in {'results':[],'candles':{},'messages':[],'future':None,'checked':0.0,
                   'last_scan':'','scan_queue':None,'scan_progress':None,'scan_total':0,'dirty':False,'journal_error':'','gist_id':secrets.get('INTRADAY_GIST_ID','')}.items():
@@ -161,6 +164,29 @@ def candle_table(df):
             groups.append(([field, label], out[label]))
     return styled_table(out, groups)
 
+CHECKS = ('CPR trend','CPR breakout/retest','PDH / PDL','EMA 9/21','VWAP','RSI 14',
+          'Supertrend 10,3','Volume 1.5x','NIFTY tide')
+
+def scan_frame(rows):
+    data=[]
+    for x in rows:
+        checks=x.get('tests',{})
+        row={'Symbol':x['symbol'],'Side':x['side'],'Score':x['score'],
+             'Qualified on candle':bool(x['eligible']),
+             'Setup bias':('Bullish' if x['side']=='CE' else 'Bearish') if x['eligible'] else 'Neutral'}
+        for name in CHECKS:
+            value=checks.get(name if name!='PDH / PDL' or name in checks else 'Camarilla/PDH-PDL')
+            row[name]='✓' if value is True else '✗' if value is False else '—'
+        row.update({'Close':round(x['close'],2),'Candle (IST)':x['candle'],
+                    'Exit ST (7,2)':x.get('exit_st'),'Reversal':x.get('reverse_now')})
+        data.append(row)
+    return pd.DataFrame(data)
+
+def scanner_style(df):
+    checks={'✓':'Bullish','✗':'Bearish','—':'Neutral'}
+    return styled_table(df,[(['Side','Setup bias'],df['Setup bias'])]+
+                        [([name],df[name].map(checks)) for name in CHECKS])
+
 def render_dashboard():
     r=st.session_state.results;j=st.session_state.journal
     m1,m2,m3,m4=st.columns(4)
@@ -175,20 +201,26 @@ def render_dashboard():
     with tabs[0]:
         st.subheader('Intraday 5-minute scanner')
         if r:
-            df=pd.DataFrame([{k:v for k,v in x.items() if k not in ('tests',)} for x in r]).sort_values(['eligible','score'],ascending=False)
-            df['Setup bias'] = [
-                ('Bullish' if side == 'CE' else 'Bearish') if ok else 'Neutral'
-                for side, ok in zip(df['side'], df['eligible'])
-            ]
-            st.caption(LEGEND + ' · Neutral means this row did not qualify. Historical rows are not live entries.')
-            st.dataframe(styled_table(df, [(['side', 'Setup bias'], df['Setup bias'])]),
-                         use_container_width=True,hide_index=True)
-            st.download_button('Download scanner CSV',df.to_csv(index=False),'intraday_scanner.csv')
+            df=scan_frame(r).sort_values(['Qualified on candle','Score','Symbol'],ascending=[False,False,True])
+            st.caption('✓ Passed · ✗ Not met · — Not verified. NIFTY tide is not scored. Historical rows are not live entries.')
+            side_view=st.radio('Scanner side',('CE · Bullish','PE · Bearish'),horizontal=True)
+            view=df[df['Side']==side_view[:2]]
+            qualified=st.checkbox('Only show qualifying setups',value=False)
+            if qualified:view=view[view['Qualified on candle']]
+            if view.empty:
+                st.info('No rows for this view.')
+            else:
+                st.dataframe(scanner_style(view),use_container_width=True,hide_index=True,
+                             column_config={'Symbol':st.column_config.TextColumn(pinned=True),
+                                            'Close':st.column_config.NumberColumn(format='%.2f')})
+            st.download_button('Download scanner CSV (both sides)',df.to_csv(index=False),'intraday_scanner.csv')
         else:st.info('Select instruments and click REFRESH.')
     with tabs[1]:
         st.subheader('Eligible CE / PE signals')
-        eligible=[x for x in r if x['eligible'] and fresh_candle(x['candle'],datetime.now(IST))]
-        if not eligible:st.info('No confirmed eligible signals in the latest scan.')
+        card_side=st.radio('Signal cards side',('CE · Bullish','PE · Bearish'),horizontal=True)
+        now=datetime.now(IST)
+        eligible=[x for x in r if x['side']==card_side[:2] and x['eligible'] and fresh_candle(x['candle'],now)]
+        if not eligible:st.info('No confirmed eligible signals for this side in the latest scan.')
         for i in range(0,len(eligible),3):
             cols=st.columns(3)
             for col,x in zip(cols,eligible[i:i+3]):
@@ -199,6 +231,9 @@ def render_dashboard():
                     <h3 style="color:{border}!important">{x['symbol']} · {x['side']} · {label}</h3>
                     <h2 style="color:#5de7ff!important">{x['score']}/8</h2><p>Underlying close ₹{x['close']:,.2f}</p>
                     <small>{x['candle']}</small></div>''',unsafe_allow_html=True)
+                    with st.expander('Condition checklist'):
+                        for name, value in x['tests'].items():
+                            st.write(('✅' if value is True else '❌' if value is False else '🟡')+' '+name)
     with tabs[2]:
         st.subheader('Candles + EMA + VWAP')
         if st.session_state.candles:
