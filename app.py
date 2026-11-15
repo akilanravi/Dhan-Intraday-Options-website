@@ -9,6 +9,7 @@ import requests
 import streamlit as st
 from intraday import intraday_candles,enrich,signal,choose_option
 from swing_core import DhanAPI,load_universe,IST,parse_chain,select_contract
+from underlying_backtest import render_backtest
 from decision_panel import show_panel, load_quote, context, number
 import hashlib
 
@@ -337,4 +338,9 @@ def render_dashboard():
                                        'End-of-day exit checks start at 15:20 IST; a valid bid is needed.'])
 
 
-dashboard()
+home, bt = st.tabs(['Intraday dashboard','Underlying Backtest'])
+with home:
+    dashboard()
+with bt:
+    render_backtest(all_u,token,client,DhanAPI,'5 min')
+
