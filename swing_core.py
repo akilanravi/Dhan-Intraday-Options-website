@@ -598,6 +598,8 @@ def parse_chain(resp):
             g = leg.get('greeks') or {}
             rows.append({'strike': strike, 'type': typ.upper(), 'ltp': num(leg.get('last_price')),
                          'bid': num(leg.get('top_bid_price')), 'ask': num(leg.get('top_ask_price')),
+                         'bid_qty': num(leg.get('top_bid_quantity')), 'ask_qty': num(leg.get('top_ask_quantity')),
+                         'previous_oi': num(leg.get('previous_oi')), 'security_id': leg.get('security_id'),
                          'delta': num(g.get('delta')), 'theta': num(g.get('theta')), 'gamma': num(g.get('gamma')), 'vega': num(g.get('vega')), 'iv': num(leg.get('implied_volatility')),
                          'oi': num(leg.get('oi')), 'volume': num(leg.get('volume'))})
     return spot, pd.DataFrame(rows)

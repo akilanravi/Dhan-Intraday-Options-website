@@ -8,7 +8,9 @@ import pandas as pd
 import requests
 import streamlit as st
 from intraday import intraday_candles,enrich,signal,choose_option
-from swing_core import DhanAPI,load_universe,IST
+from swing_core import DhanAPI,load_universe,IST,parse_chain,select_contract
+from decision_panel import show_panel, load_quote, context, number
+import hashlib
 
 from paper_engine import PaperStore, universe, worker_pool, fresh_candle, refresh_cycle
 from worker_store import cloud_journal, enabled
@@ -197,7 +199,7 @@ def render_dashboard():
     if ss.messages:
         with st.expander('Scan and paper-trading diagnostics', expanded=not r):
             for msg in ss.messages:st.write(msg)
-    tabs=st.tabs(['1 · Market scanner','2 · Eligible signal cards','3 · Trade analysis','4 · Paper trading','5 · Conditions'])
+    tabs=st.tabs(['1 · Market scanner','2 · Eligible signal cards','3 · Trade analysis','4 · Paper trading','5 · Conditions','6 · Trade Decision'])
     with tabs[0]:
         st.subheader('Intraday 5-minute scanner')
         if r:
@@ -282,6 +284,57 @@ def render_dashboard():
                 for k,v in x['tests'].items():
                     st.markdown(('🟢' if v is True else '🔴' if v is False else '🟡')+' '+k+(' — not verified' if v is None else ''))
         st.caption('Combined entry requires ≥ threshold, ST(10,3), EMA9/21, VWAP, volume 1.5×, and CPR/PDH trigger. Exit: premium SL, 2R target, ST(7,2) reversal, opposing eligible signal or 15:20 IST. These are configurable research rules, not a verified profitable strategy.')
+
+    with tabs[5]:
+        st.subheader('Intraday trade decision')
+        if not r:
+            st.info('Run a Market Scanner scan first.')
+        else:
+            symbol=st.selectbox('Decision symbol', sorted({x['symbol'] for x in r}), key='idea_i_symbol')
+            side=st.radio('Decision side',('CE','PE'),horizontal=True,key='idea_i_side')
+            match=next((x for x in r if x['symbol']==symbol and x['side']==side),None)
+            meta=all_u[all_u.symbol.eq(symbol)]
+            if match is None or meta.empty:
+                st.info('No matching scan row or Dhan instrument mapping.')
+            else:
+                idea={**meta.iloc[0].to_dict(),**match,'mode':'intraday',
+                      'reason':f"{match['score']}/8 · Existing scanner eligibility",
+                      'account':hashlib.sha256(token.encode()).hexdigest()}
+                journal_ok=not ss.journal_error and (not worker_mode or bool(ss.get('worker_status')))
+                policy=dict(capital=capital,cap=cap,risk=risk,stop=stop/100,target_r=target,slip=.005,
+                    delta_lo=.4,delta_hi=.75,spread=5,min_days=2,exposure=35,max_open=3,
+                    has_connection=bool(token and client),journal_ok=bool(journal_ok),
+                    start=(9,45),end=(15,10),window='09:45–15:10 IST (regular weekdays)',worker_mode=worker_mode)
+                checks=[('Fresh 5-minute signal',bool(fresh_candle(match['candle'],datetime.now(IST))),
+                         'Only the latest completed 5-minute candle can be considered.')]
+                def inspect(p):
+                    api=DhanAPI(token,client)
+                    notes=[]
+                    d=ss.candles.get(symbol)
+                    if d is not None and not d.empty:
+                        levels=('orb_hi','pdh','tc') if side=='CE' else ('orb_lo','pdl','bc')
+                        last=d.iloc[-1]
+                        levels=[(k,number(last.get(k))) for k in levels]
+                        ahead=[(k,v) for k,v in levels if v is not None and (v>match['close'] if side=='CE' else v<match['close'])]
+                        if ahead:
+                            name,level=min(ahead,key=lambda x:abs(x[1]-match['close']))
+                            notes.append(f'Nearest tracked level ahead from signal close: {name} {level:,.2f} ({abs(level-match["close"]):,.2f} underlying points). This is not an option target.')
+                        else:notes.append('No tracked level ahead from signal close. This does not establish a clear path to target.')
+                    try:
+                        gates,_=context(api,idea,p)
+                    except Exception as exc:
+                        gates=[('15-minute EMA trend',None,'No verified timeframe data · '+str(exc)[:130])]
+                    def expiry(dates,today):
+                        return next((d for d in sorted(pd.Timestamp(x).date() for x in dates)
+                                     if (d-today).days>=p['min_days']),None)
+                    try:return load_quote(api,idea,p,expiry,parse_chain,select_contract),None,gates,notes
+                    except Exception as exc:return None,str(exc)[:230],gates,notes
+                if worker_mode: st.caption('This panel uses dashboard settings. The independent worker follows worker.env and is not controlled by this panel.')
+                show_panel(idea,policy,j,inspect,key='preflight_intraday',base_checks=checks,
+                           critical_context=['15-minute EMA trend'],
+                           exit_rules=['Premium stop or target at an observed Dhan bid.',
+                                       'Supertrend (7,2) reversal or opposing eligible signal.',
+                                       'End-of-day exit checks start at 15:20 IST; a valid bid is needed.'])
 
 
 dashboard()
