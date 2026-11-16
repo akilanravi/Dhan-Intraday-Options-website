@@ -10,7 +10,7 @@ from swing_core import DhanAPI,IST,parse_chain,select_contract
 from underlying_backtest import render_backtest
 from decision_panel import show_panel, load_quote, context, number
 from paper_engine import universe, fresh_candle
-from dashboard_runtime import get_runtime
+import dashboard_runtime as scanner_runtime
 from scan_clock import scheduled_slot, regular_day, completed_slot, write_window
 from worker_store import enabled
 
@@ -29,6 +29,14 @@ h1{background:linear-gradient(90deg,#6ee7ff,#b69bff,#ff76c7);-webkit-background-
 
 st.title('DHAN QUANT · INTRADAY OPTIONS TERMINAL')
 st.caption('Dhan only · 5-minute completed candles · CE/PE · no Telegram · no real broker orders')
+st.caption('Build 5.1 · Fast Refresh · 5% default paper risk')
+
+RUNTIME_API_REQUIRED=2
+UPDATE_NOTE=('Scanner files are out of sync. Replace app.py and dashboard_runtime.py from the same ZIP '
+             'in one commit, then use Manage app → Reboot app. Keep your existing secrets.')
+if getattr(scanner_runtime,'DASHBOARD_RUNTIME_API',None)!=RUNTIME_API_REQUIRED:
+    st.error(UPDATE_NOTE)
+    st.stop()
 try: secrets=dict(st.secrets)
 except Exception: secrets={}
 worker_mode=enabled(secrets.get('PAPER_WORKER_MODE',os.getenv('PAPER_WORKER_MODE','')))
@@ -73,7 +81,10 @@ github=str(secrets.get('GITHUB_TOKEN',''))
 gist=str(secrets.get('INTRADAY_GIST_ID',''))
 params=dict(threshold=threshold,capital=capital,cap=cap,stop=stop,target=target,risk=risk,auto=auto)
 settings={'NSE_CLOSED_DATES':secrets.get('NSE_CLOSED_DATES',os.getenv('NSE_CLOSED_DATES',''))}
-runtime=get_runtime((worker_mode,gist),worker_mode,github,gist,ss.runtime_owner)
+runtime=scanner_runtime.get_runtime((RUNTIME_API_REQUIRED,worker_mode,gist),worker_mode,github,gist,ss.runtime_owner)
+if getattr(runtime,'api_version',None)!=RUNTIME_API_REQUIRED:
+    st.error(UPDATE_NOTE)
+    st.stop()
 
 
 @st.fragment(run_every=3)
@@ -84,7 +95,7 @@ def dashboard():
     grace=configured_market and (9,20)<=(clock.hour,clock.minute)<(15,35) and scheduled_slot(clock,settings) is None
     manual=st.button('Pull latest worker results' if worker_mode else '🔄 REFRESH NOW',
                      type='primary')
-    data=runtime.step(clock,settings,manual,lookup,token,client,params,ss.runtime_owner,priority)
+    data=runtime.step(clock,settings,manual,lookup,token,client,params,ss.runtime_owner,priority=priority)
     ss.live=data
     if data.notice:st.caption(data.notice)
     elif manual and grace and not worker_mode:st.caption('Waiting briefly for Dhan to publish the new closed candle.')

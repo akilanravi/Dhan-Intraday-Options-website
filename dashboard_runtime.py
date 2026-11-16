@@ -9,18 +9,23 @@ from paper_engine import PaperStore, refresh_cycle, worker_pool
 from worker_store import cloud_journal
 from scan_clock import scheduled_slot, regular_day
 
+DASHBOARD_RUNTIME_API = 2
+
+
 @st.cache_resource
-def runtimes():
+def runtimes(api_version):
     return {}, RLock()
 
 def get_runtime(key, mode, token, gist, owner):
-    items, lock = runtimes()
+    items, lock = runtimes(DASHBOARD_RUNTIME_API)
     with lock:
         if key not in items:
             items[key]=Runtime(mode,token,gist,owner)
         return items[key]
 
 class Runtime:
+    api_version = DASHBOARD_RUNTIME_API
+
     def __init__(self, mode, github, gist, owner):
         self.lock=RLock()
         self.mode=mode
