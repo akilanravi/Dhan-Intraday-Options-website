@@ -3,7 +3,7 @@ import pandas as pd
 from swing_core import IST
 
 BAR = pd.Timedelta(minutes=5)
-FEED_GRACE = pd.Timedelta(seconds=10)
+FEED_GRACE = pd.Timedelta(seconds=2)
 
 def timestamp(value):
     t = pd.Timestamp(value)

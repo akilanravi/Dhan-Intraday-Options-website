@@ -200,7 +200,7 @@ class CandleMemo:
         # Overlap one known bar to tolerate inclusive/exclusive fromDate boundaries.
         # Pin the request end to the completed candle; backfill the gap after downtime.
         since=max(cutoff,old.index[-1]) if old is not None and not old.empty else None
-        through=slot+BAR if slot is not None and not force else None
+        through=slot+BAR if slot is not None else None
         if since is not None and through is not None and since>=through:
             since=slot-BAR
         new=intraday_candles(api,x,since=since,through=through)
@@ -221,7 +221,7 @@ _MEMO=CandleMemo()
 
 
 def refresh_cycle(token,client,lookup,selected,j,threshold,capital,cap,stop,target,risk,auto,store,dirty,
-                  progress=None,journal_ready=True,slot=None,allow_trades=True,
+                  progress=None,journal_ready=True,slot=None,allow_trades=True,on_signals=None,
                   clock_fn=lambda:datetime.now(IST)):
     """Pin all scores to one candle. Prioritize exits, then rank the complete batch."""
     started=time.monotonic()
@@ -258,8 +258,9 @@ def refresh_cycle(token,client,lookup,selected,j,threshold,capital,cap,stop,targ
         return frame, signal(frame,symbol,threshold)
 
     delayed=[]
+    next_preview=12
     def record(symbol,fetch,retry=False):
-        nonlocal blocked,attempted,successful
+        nonlocal blocked,attempted,successful,next_preview
         published=[]
         chart=None
         if not retry:attempted+=1
@@ -271,6 +272,14 @@ def refresh_cycle(token,client,lookup,selected,j,threshold,capital,cap,stop,targ
             else:
                 if symbol in selected_set:
                     chart=candles[symbol]=d.tail(90).copy()
+                    detected=clock_fn()
+                    for row in rows:
+                        if slot is not None:
+                            row['detected_at']=detected.isoformat(timespec='seconds')
+                            row['detect_seconds']=round(max(0,(pd.Timestamp(detected)-(slot+BAR)).total_seconds()),1)
+                        bar=d.iloc[-1]
+                        row['ohlv']={k:(float(bar[k]) if math.isfinite(float(bar[k])) else None)
+                                     for k in ('Open','High','Low','Volume')}
                     published=rows
                 results[symbol]=rows
                 successful+=1
@@ -279,6 +288,14 @@ def refresh_cycle(token,client,lookup,selected,j,threshold,capital,cap,stop,targ
             errors.append(f'{symbol}: {msg}')
             blocked=blocked or any(code in msg for code in ('DH-901','DH-902','HTTP 401','HTTP 403'))
         if progress is not None:progress.put((attempted,successful,symbol,errors[-1] if errors else '',published,chart))
+        if on_signals is not None and time.monotonic()-started>=next_preview:
+            preview=[r for sym in selected for r in results.get(sym,[])]
+            if any(r['eligible'] for r in preview):
+                next_preview = time.monotonic()-started+22
+                try:
+                    on_signals(preview,candles,[f'{successful}/{len(selected)} symbols checked; scan still running.'])
+                except Exception as e:
+                    errors.append(f'Live preview failed: {e}')
 
     old=j.copy(deep=True)
     open_symbols=set() if j.empty else set(j.loc[j.status=='OPEN','symbol'])
@@ -288,7 +305,7 @@ def refresh_cycle(token,client,lookup,selected,j,threshold,capital,cap,stop,targ
     with trade_api.session:
         try:
             with ThreadPoolExecutor(max_workers=10,thread_name_prefix='dhan-candles') as pool:
-                priority=[s for s in ordered if s in open_symbols and s in lookup] or ordered[:1]
+                priority=[s for s in ordered if s in open_symbols and s in lookup]
                 def run_batch(symbols,retry=False):
                     pending={}
                     todo=iter(symbols)
@@ -303,12 +320,15 @@ def refresh_cycle(token,client,lookup,selected,j,threshold,capital,cap,stop,targ
                         for f in done:record(pending.pop(f),f.result,retry)
                         refill()
                 run_batch(priority)
-                clock=clock_fn()
-                if write_window(clock) and allow_trades and journal_ready and open_symbols:
-                    smap={(r['symbol'],r['side']):r for rows in results.values() for r in rows if fresh_candle(r['candle'],clock)}
-                    j,exits=update_positions(j,trade_api,lookup,smap,stop,target,clock_fn)
                 priority_set=set(priority)
                 run_batch([s for s in ordered if s not in priority_set])
+                # Publish fresh first-pass rows before retrying missing symbols in worker mode.
+                if delayed and on_signals is not None and results:
+                    try:
+                        on_signals([r for sym in selected for r in results.get(sym,[])],candles,
+                                   [f'{successful}/{len(ordered)} symbols after first pass; retrying delayed candles.'])
+                    except Exception as e:
+                        errors.append(f'First-pass publish failed: {e}')
                 run_batch(delayed.copy(),retry=True)
         finally:
             for session in sessions:session.close()
@@ -316,9 +336,17 @@ def refresh_cycle(token,client,lookup,selected,j,threshold,capital,cap,stop,targ
         out=[r for sym in selected for r in results.get(sym,[])]
         wanted=len(ordered)
         summary=(f'{successful}/{wanted} symbols returned the requested candle · '
-                 f'{attempted} attempted · {time.monotonic()-started:.1f} seconds (candle scan and exit checks).')
+                 f'{attempted} attempted · {time.monotonic()-started:.1f} seconds (candle scan only).')
         if attempted<wanted and not blocked:errors.append('Candle scan time budget reached. Unfinished symbols will be checked on the next candle.')
         if blocked:errors.insert(0,'Dhan rejected authentication or data access. Check token and Data API entitlement.')
+        if on_signals is not None:
+            try:
+                on_signals(out,candles,[summary,*errors])
+            except Exception as e:
+                errors.append(f'Early signal publish failed: {e}')
+        if write_window(clock) and allow_trades and journal_ready and open_symbols:
+            smap={(r['symbol'],r['side']):r for rows in results.values() for r in rows if fresh_candle(r['candle'],clock)}
+            j,exits=update_positions(j,trade_api,lookup,smap,stop,target,clock_fn)
         if not journal_ready:entries=['Paper journal unavailable. Scanning continues, but simulation is paused.']
         elif not allow_trades:entries=['This is a read-only historical scan.']
         elif dirty:entries=['Paper journal has an unsaved update. New entries paused until it is saved.']

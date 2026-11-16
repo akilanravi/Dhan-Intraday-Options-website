@@ -2,3 +2,6 @@
 __pycache__/
 intraday_paper_trades.csv
 intraday_paper_trades.tmp
+intraday_signal_times.json
+intraday_signal_times.tmp
+worker.env

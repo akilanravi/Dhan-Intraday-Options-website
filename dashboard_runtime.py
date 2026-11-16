@@ -7,9 +7,10 @@ import pandas as pd
 import streamlit as st
 from paper_engine import PaperStore, refresh_cycle, worker_pool
 from worker_store import cloud_journal
-from scan_clock import scheduled_slot, regular_day
+from scan_clock import scheduled_slot, regular_day, completed_slot
+from signal_history import collect, read_local, save_local, read_gist, save_gist, merge
 
-DASHBOARD_RUNTIME_API = 3
+DASHBOARD_RUNTIME_API = 4
 
 
 @st.cache_resource
@@ -55,18 +56,34 @@ class Runtime:
         self.error=''
         self.checked=-1e6
         self.cloud_status={}
+        self.signal_history={}
+        self.history_written={}
+        self.history_checked=0
+        self.history_future=None
+        self.history_error=""
 
     def load(self, previous_id):
         if self.mode:
             if self.cloud is None:
                 self.cloud=cloud_journal(self.github,self.store.gist,'intraday')
             return self.cloud.read(snapshot=True,previous_id=previous_id)
-        return self.store.load(),None,None
+        try: history=read_local()
+        except (ValueError,OSError): history={}
+        frame=self.store.load()
+        if self.github and self.store.gist:
+            try:
+                history=merge(history,read_gist(self.github,self.store.gist))
+            except (ValueError,OSError) as exc:
+                self.history_error=f'Signal history read failed: {exc}'
+        return frame,{'signal_history':history},None
 
     def finish_load(self):
         try:
             frame,status,snap=self.load_future.result()
             if frame is not None:self.journal=frame
+            if status is not None:
+                self.signal_history=status.get('signal_history',self.signal_history)
+                self.history_written=self.signal_history
             if self.mode and status is not None:
                 if snap is not None:
                     self.rows,self.candles,slot=snap
@@ -98,7 +115,7 @@ class Runtime:
                     self.manual_requested=True
                     self.notice='Refresh requested.'
             if self.load_future is not None and self.load_future.done():self.finish_load()
-            if self.load_future is None and self.future is None and (self.mode or not self.loaded) and (request or time.monotonic()-self.checked>=15):
+            if self.load_future is None and self.future is None and (self.mode or not self.loaded) and (request or time.monotonic()-self.checked>=(5 if self.mode and scheduled_slot(clock,settings) is not None and (self.slot!=completed_slot(clock) or self.cloud_status.get('phase')=='preview') else 15)):
                 self.checked=time.monotonic()
                 self.load_future=worker_pool().submit(self.load,self.cloud_status.get('snapshot_id',''))
             while True:
@@ -111,6 +128,7 @@ class Runtime:
                         symbol=packet[2]
                         self.preview_rows[symbol]=rows
                         self.preview_candles[symbol]=candles
+                        self.signal_history=collect(self.signal_history,rows,self.requested_slot)
             if self.future is not None and self.future.done():
                 try:
                     rows,candles,journal,self.notes,_,self.dirty,self.stamp=self.future.result()
@@ -124,6 +142,22 @@ class Runtime:
                     self.notes=['Refresh failed: '+str(e)[:180]]
                 self.future=None
                 self.notice=''
+            if self.history_future is not None and self.history_future.done():
+                try:
+                    self.history_written=self.history_future.result()
+                    self.history_error=''
+                except Exception as exc:
+                    self.history_error=f'Could not sync signal timestamps: {exc}'
+                self.history_future=None
+            if not self.mode and self.history_future is None and self.signal_history!=self.history_written and time.monotonic()-self.history_checked>=5:
+                self.history_checked=time.monotonic()
+                snapshot=self.signal_history
+                def persist():
+                    save_local(snapshot)
+                    if self.github and self.store.gist:
+                        save_gist(self.github,self.store.gist,snapshot)
+                    return snapshot
+                self.history_future=worker_pool().submit(persist)
             slot=scheduled_slot(clock,settings)
             grace=regular_day(clock,settings) and (9,20)<=(clock.hour,clock.minute)<(15,35) and slot is None
             if not self.mode and self.future is None and self.load_future is None and not grace:
@@ -153,6 +187,6 @@ class Runtime:
             candles=self.preview_candles.copy() if partial else self.candles
             return SimpleNamespace(rows=rows,candles=candles,journal=self.journal,notes=self.notes,
                 partial=partial,preview_slot=self.requested_slot if partial else None,notice=self.notice,
-                stamp=self.stamp,slot=self.slot,progress=self.progress,future=self.future,error=self.error,
-                status=self.cloud_status,gist=self.store.gist,controller=controller,
+                stamp=self.stamp,slot=self.slot,progress=self.progress,future=self.future,error=self.error or self.history_error,
+                status=self.cloud_status,gist=self.store.gist,controller=controller,signal_history=self.signal_history,
                 policy=self.cloud_status.get('policy',{}) if self.mode else getattr(self,'policy',params))

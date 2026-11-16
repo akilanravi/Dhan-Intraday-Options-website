@@ -14,6 +14,7 @@ import dashboard_runtime as scanner_runtime
 from scan_clock import BAR, timestamp, scheduled_slot, regular_day, completed_slot, write_window
 from worker_store import enabled
 from paper_report import performance_by_symbol
+from signal_history import times_for
 
 st.set_page_config(page_title='DHAN QUANT · INTRADAY',layout='wide',page_icon='📈')
 st.markdown('''<style>
@@ -30,10 +31,10 @@ h1{background:linear-gradient(90deg,#6ee7ff,#b69bff,#ff76c7);-webkit-background-
 
 st.title('DHAN QUANT · INTRADAY OPTIONS TERMINAL')
 st.caption('Dhan only · 5-minute completed candles · CE/PE · no Telegram · no real broker orders')
-st.caption('Build 5.2 · Five-minute candle view · No daily paper-entry cap')
+st.caption('Build 5.3 · Live signal timestamps · No daily paper-entry cap')
 
-RUNTIME_API_REQUIRED=3
-UPDATE_NOTE=('Scanner files are out of sync. Replace app.py and dashboard_runtime.py from the same ZIP '
+RUNTIME_API_REQUIRED=4
+UPDATE_NOTE=('Scanner files are out of sync. Replace the project files together from the same ZIP '
              'in one commit, then use Manage app → Reboot app. Keep your existing secrets.')
 if getattr(scanner_runtime,'DASHBOARD_RUNTIME_API',None)!=RUNTIME_API_REQUIRED:
     st.error(UPDATE_NOTE)
@@ -109,7 +110,9 @@ def dashboard():
     if data.partial and data.preview_slot is not None:
         st.caption(f'Receiving candle closed at {candle_close(data.preview_slot)}. Missing symbols are not filled with older data.')
     checked=pd.Timestamp(data.stamp).tz_convert(IST).strftime('%d %b %H:%M:%S IST') if data.stamp else '—'
-    st.caption(f'Published candle close: {end} · Last completed check: {checked}')
+    st.caption(f'Published candle close: {end} · Last snapshot update: {checked}')
+    if worker_mode and data.status.get('phase')=='preview':
+        st.caption('Live worker preview. Signals are available before paper checks and full chart history finish.')
     if data.progress is not None:
         done,ok,symbol,_=data.progress
         st.caption(f'Scan progress {done}/{len(lookup)} checked · {ok} with candle data'+(f' · Last: {symbol}' if symbol else ''))
@@ -174,19 +177,22 @@ def candle_range(value):
 def candle_close(value):
     return f'{timestamp(value)+BAR:%d %b %H:%M} IST'
 
-def scan_frame(rows, candles=None):
+def scan_frame(rows, candles=None, history=None):
     data=[]
     for x in rows:
         checks=x.get('tests',{})
         row={'Symbol':x['symbol'],'Side':x['side'],'Score':x['score'],
              'Qualified on candle':bool(x['eligible']),
+             'Qualified closes (IST)':times_for(history or {},x),
+             'Detected (IST)':pd.Timestamp(x['detected_at']).strftime('%H:%M:%S') if x.get('detected_at') else '',
+             'Detection delay (s)':x.get('detect_seconds'),
              'Setup bias':('Bullish' if x['side']=='CE' else 'Bearish') if x['eligible'] else 'Neutral',
              'Volume source':x.get('volume_source','—')}
         for name in CHECKS:
             value=checks.get(name if name!='PDH / PDL' or name in checks else 'Camarilla/PDH-PDL')
             row[name]='✓' if value is True else '✗' if value is False else '—'
         raw=(candles or {}).get(x['symbol'])
-        bar=raw.iloc[-1] if raw is not None and not raw.empty and raw.index[-1]==timestamp(x['candle']) else {}
+        bar=x.get('ohlv') or (raw.iloc[-1] if raw is not None and not raw.empty and raw.index[-1]==timestamp(x['candle']) else {})
         row.update({'Open':bar.get('Open'),'High':bar.get('High'),'Low':bar.get('Low'),
                     'Close':round(x['close'],2),'Volume':bar.get('Volume'),
                     'Candle close (IST)':candle_close(x['candle']),
@@ -195,8 +201,8 @@ def scan_frame(rows, candles=None):
         data.append(row)
     return pd.DataFrame(data)
 
-def scanner_table(rows,candles):
-    return scan_frame(rows,candles).sort_values(['Qualified on candle','Score','Symbol'],ascending=[False,False,True])
+def scanner_table(rows,candles,history=None):
+    return scan_frame(rows,candles,history).sort_values(['Qualified on candle','Score','Symbol'],ascending=[False,False,True])
 
 def scanner_style(df):
     checks={'✓':'Bullish','✗':'Bearish','—':'Neutral'}
@@ -220,7 +226,7 @@ def render_dashboard(tab,live):
         m4.metric('Open paper trades',0 if j.empty else int((j.status=='OPEN').sum()))
         st.subheader('Latest completed 5-minute data')
         if r:
-            df=scanner_table(r,live.candles)
+            df=scanner_table(r,live.candles,live.signal_history)
             st.caption('✓ Passed · ✗ Not met · — Not verified. NIFTY tide is not scored. Historical rows are not live entries.')
             side_view=st.radio('Scanner side',('Both','CE · Bullish','PE · Bearish'),horizontal=True,key='scanner_side_52')
             view=df if side_view=='Both' else df[df['Side']==side_view[:2]]
@@ -234,9 +240,9 @@ def render_dashboard(tab,live):
             if view.empty:
                 st.info('No rows for this view.')
             else:
-                st.dataframe(scanner_style(view),width='stretch',hide_index=True,
+                st.dataframe(scanner_style(view) if len(view)<=80 else view,width='stretch',hide_index=True,
                              column_order=['Symbol','Side','Candle close (IST)','Open','High','Low','Close','Volume',
-                                           'Score','Qualified on candle',*CHECKS,'Setup bias','Volume source','Candle start (IST)',
+                                           'Score','Qualified on candle','Qualified closes (IST)','Detected (IST)','Detection delay (s)',*CHECKS,'Setup bias','Volume source','Candle start (IST)',
                                            'Exit ST (7,2)','Reversal'],
                              column_config={'Symbol':st.column_config.TextColumn(pinned=True),
                                             'Close':st.column_config.NumberColumn(format='%.2f')})
@@ -244,6 +250,8 @@ def render_dashboard(tab,live):
         else:st.info('Waiting for the first full-universe scan. In dashboard mode, Refresh Now can also load a historical preview.')
     if tab == 1:
         st.subheader('Eligible CE / PE signals')
+        history=live.signal_history
+        st.caption('Qualifying times are candle closes in IST, saved separately for CE and PE. Detection delay measures when the scanner scored the candle, not when it reached your browser.')
         card_side=st.radio('Signal cards side',('CE · Bullish','PE · Bearish'),horizontal=True,key='signal_cards_side_52')
         eligible=sorted((x for x in r if x['side']==card_side[:2] and x['eligible']),key=lambda x:(-x['score'],x['symbol']))
         if not eligible:st.info('No eligible signals for this side in the displayed candle snapshot.')
@@ -256,10 +264,23 @@ def render_dashboard(tab,live):
                     st.markdown(f'''<div style="background:#10223a;border:2px solid {border};border-radius:17px;padding:18px;color:#eaf4ff">
                     <h3 style="color:{border}!important">{html.escape(x['symbol'])} · {x['side']} · {label}</h3>
                     <h2 style="color:#5de7ff!important">{x['score']}/8</h2><p>Underlying close ₹{x['close']:,.2f}</p>
-                    <small>{candle_range(x['candle'])}</small></div>''',unsafe_allow_html=True)
+                    <small>{candle_range(x['candle'])}</small>
+                    <p>Qualified closes (IST): {html.escape(times_for(history,x) or '—')}</p>
+                    <small>{html.escape(('Detected in '+str(x['detect_seconds'])+' s · '+('Within 60 s' if x['detect_seconds']<=60 else 'Over 60 s')) if x.get('detect_seconds') is not None else 'Detection time unavailable')}</small></div>''',unsafe_allow_html=True)
                     with st.expander('Condition checklist'):
+                        st.caption('Qualified closes (IST): '+(times_for(history,x) or '—'))
                         for name, value in x['tests'].items():
                             st.write(('✅' if value is True else '❌' if value is False else '🟡')+' '+name)
+        saved=[{'Session (IST)':history.get('date'),'Symbol':key.rsplit(' ',1)[0],'Side':key.rsplit(' ',1)[1],
+                'Qualified closes (IST)':', '.join(values),'Count':len(values)}
+               for key,values in sorted(history.get('times',{}).items()) if key.endswith(' '+card_side[:2])]
+        with st.expander('Saved session signals · includes setups no longer eligible',expanded=not eligible):
+            if saved:
+                df=pd.DataFrame(saved)
+                st.dataframe(df,width='stretch',hide_index=True)
+                st.download_button('Export qualifying times CSV',df.to_csv(index=False),'intraday_signal_times.csv')
+            else:
+                st.info('No qualifying times saved for this side in the current scan session.')
     if tab == 2:
         st.subheader('Candles + EMA + VWAP')
         if live.candles:

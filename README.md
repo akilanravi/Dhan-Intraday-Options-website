@@ -42,3 +42,39 @@ Dhan references for [Historical Data](https://dhanhq.co/docs/v2/historical-data/
 ## Local verification
 
 Run `python -m unittest discover -s tests -v` in the project folder. The tests use mocked broker data and do not submit orders.
+
+## Build 5.3 · signal timestamps and earlier publishing
+
+Update the whole project together. If using the independent worker, restart it
+with the new files as well as redeploying the Streamlit dashboard. Keep your
+existing Streamlit Secrets and private worker.env. Do not copy settings from the
+example over your live credentials. The two run modes remain mutually exclusive
+for paper writing. Dashboard mode needs a connected browser, while worker mode
+can run independently of the browser.
+
+- Automatic scanning starts after a 2-second feed grace (plus the next browser
+  fragment or worker poll). It scores only the requested completed candle.
+- Dashboard mode shows rows as symbols arrive. Worker mode sends compact signal
+  previews during the scan when eligible results are available and publishes
+  candle results ahead of paper-option lookups. Full chart payload and journal
+  are still included in the final worker snapshot. While waiting for a new
+  candle or final snapshot the dashboard checks the worker every ~5 seconds.
+- Eligible CE/PE cards, their condition checklists, the scanner and the session
+  export show all observed qualifying close times (e.g. 09:45, 09:50, 10:00).
+  Renewed eligibility after a gap is recorded too. Manual refreshes cannot
+  duplicate a timestamp. Existing older scan snapshots remain readable.
+- Worker mode saves the latest session history in the private worker Gist.
+  Dashboard mode saves it locally and syncs to the private Gist when
+  GITHUB_TOKEN and INTRADAY_GIST_ID are configured. Without a Gist, local files
+  may disappear on Streamlit Cloud restart/redeploy. Export the CSV to keep a
+  separate permanent copy.
+  The displayed list rolls over at the next observed session, not midnight.
+  Missed scans are not reconstructed.
+- Detection delay is measured from candle close to scoring. It is not cloud-to-
+  browser delivery delay. 60 seconds is a target, not guaranteed: Dhan's REST
+  historical-data limit is 5 requests/second, and the scan uses conservative
+  pacing. Slow/missing Dhan data, retries and cloud polling can push delivery
+  later. Use the priority list to bring the most important symbols forward.
+  For a tighter full-universe target, an always-on Dhan WebSocket candle
+  aggregation service would be a separate deployment. No new paid tools or
+  Yahoo data are used here.

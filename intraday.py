@@ -6,7 +6,8 @@ from swing_core import DhanAPI, BASE, IST, ema, atr, parse_chain, select_contrac
 
 
 def intraday_candles(api, x, days=8, since=None, through=None):
-    end = datetime.now(IST)
+    now = datetime.now(IST)
+    end = min(now, pd.Timestamp(through)) if through is not None else now
     start = since if since is not None else end - timedelta(days=days)
     payload = {'securityId': str(x['sid']), 'exchangeSegment': x['segment'], 'instrument': x['instrument'],
                'interval': '5', 'oi': False, 'fromDate': start.strftime('%Y-%m-%d %H:%M:%S'),
@@ -14,8 +15,8 @@ def intraday_candles(api, x, days=8, since=None, through=None):
     result = api.post('/charts/intraday', payload)
     data = result.get('data', result)
     if not isinstance(data, dict) or not data.get('timestamp'):
-        raise ValueError('No intraday candles returned')
-    d = pd.DataFrame({k: data.get(v, []) for k, v in [('Open','open'),('High','high'),('Low','low'),('Close','close'),('Volume','volume')]})
+        return pd.DataFrame(columns=['Open','High','Low','Close','Volume'], index=pd.DatetimeIndex([],tz=IST))
+    d = pd.DataFrame({k: data.get(v, [0]*len(data['timestamp'])) for k, v in [('Open','open'),('High','high'),('Low','low'),('Close','close'),('Volume','volume')]})
     d.index = pd.to_datetime(data['timestamp'], unit='s', utc=True).tz_convert(IST)
     d = d.apply(pd.to_numeric, errors='coerce').dropna(subset=['Open','High','Low','Close']).sort_index()
     d = d[~d.index.duplicated(keep='last')]

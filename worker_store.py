@@ -1,5 +1,6 @@
 """One durable journal writer per strategy. Dashboards only read in worker mode."""
 import json
+import uuid
 import re
 import os
 import requests
@@ -48,7 +49,7 @@ class CloudJournal:
         state=dict(state)
         if chunks is not None:
             state['snapshot_parts']=len(chunks)
-            state['snapshot_id']=state['checked_at']
+            state['snapshot_id']=uuid.uuid4().hex
         else:
             for key in ('snapshot_id','snapshot_parts'):
                 if key in previous:state[key]=previous[key]
@@ -62,6 +63,7 @@ class CloudJournal:
                 files[f'{PREFIX}{i:02}.txt']=None
         r=requests.patch(self.url,headers=self.headers,json={'files':files},timeout=25)
         if not r.ok:raise RuntimeError(f'GitHub journal write HTTP {r.status_code}')
+        return state
 
 def cloud_journal(token,gist,strategy):
     return CloudJournal(token,gist,strategy)
