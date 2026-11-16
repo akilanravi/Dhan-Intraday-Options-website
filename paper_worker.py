@@ -31,7 +31,7 @@ def cycle(env, journal, universe, now=None, pending=None):
     selected=list(lookup)
     cfg=lambda name,default:float(env.get('INTRADAY_'+name,default))
     policy=dict(threshold=int(cfg('SCORE',7)),capital=cfg('CAPITAL',100000),cap=cfg('TRADE_CAP',35000),
-                stop=cfg('STOP_PCT',20),target=cfg('TARGET_R',2),risk=cfg('RISK_PCT',1),
+                stop=cfg('STOP_PCT',20),target=cfg('TARGET_R',2),risk=cfg('RISK_PCT',5),
                 auto=enabled(env.get('ALLOW_NEW_ENTRIES','true')))
     if not (5<=policy['threshold']<=8 and policy['capital']>0 and 0<policy['cap']<=35000
             and 0<policy['stop']<100 and policy['target']>0 and 0<policy['risk']<=100):

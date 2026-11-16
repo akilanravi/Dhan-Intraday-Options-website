@@ -198,8 +198,13 @@ class CandleMemo:
             old=self.data.get(key)
         if old is not None and not force and slot is not None and slot in old.index:
             return old.loc[(old.index>=cutoff)&(old.index<=slot)]
-        since=max(cutoff,old.index[-1]-BAR) if old is not None and not old.empty else None
-        new=intraday_candles(api,x,since=since)
+        # Overlap one known bar to tolerate inclusive/exclusive fromDate boundaries.
+        # Pin the request end to the completed candle; backfill the gap after downtime.
+        since=max(cutoff,old.index[-1]) if old is not None and not old.empty else None
+        through=slot+BAR if slot is not None else None
+        if since is not None and through is not None and since>=through:
+            since=slot-BAR
+        new=intraday_candles(api,x,since=since,through=through)
         raw=pd.concat([old,new]) if old is not None else new
         raw=raw[~raw.index.duplicated(keep='last')].sort_index().loc[lambda d:d.index>=cutoff]
         # Suppress pre-open/after-hours records, which would corrupt VWAP and prior-day levels.
@@ -256,6 +261,8 @@ def refresh_cycle(token,client,lookup,selected,j,threshold,capital,cap,stop,targ
     delayed=[]
     def record(symbol,fetch,retry=False):
         nonlocal blocked,attempted,successful
+        published=[]
+        chart=None
         if not retry:attempted+=1
         try:
             d,rows=fetch()
@@ -263,14 +270,16 @@ def refresh_cycle(token,client,lookup,selected,j,threshold,capital,cap,stop,targ
                 if not retry:delayed.append(symbol)
                 else:errors.append(f'{symbol}: Dhan did not return the scheduled closed candle')
             else:
-                if symbol in selected_set:candles[symbol]=d.tail(90).copy()
+                if symbol in selected_set:
+                    chart=candles[symbol]=d.tail(90).copy()
+                    published=rows
                 results[symbol]=rows
                 successful+=1
         except Exception as e:
             msg=str(e)[:210]
             errors.append(f'{symbol}: {msg}')
             blocked=blocked or any(code in msg for code in ('DH-901','DH-902','HTTP 401','HTTP 403'))
-        if progress is not None:progress.put((attempted,successful,symbol,errors[-1] if errors else ''))
+        if progress is not None:progress.put((attempted,successful,symbol,errors[-1] if errors else '',published,chart))
 
     old=j.copy(deep=True)
     open_symbols=set() if j.empty else set(j.loc[j.status=='OPEN','symbol'])

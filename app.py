@@ -38,11 +38,11 @@ with st.sidebar:
     client=st.text_input('Client ID',value=str(secrets.get('DHAN_CLIENT_ID','')),type='password').strip()
     if worker_mode:
         st.caption('The independent worker owns scanning and paper entries. Edit worker.env to change its settings.')
-        capital,cap,risk,stop,target,threshold,auto=100000,35000,1.0,20,2.0,7,True
+        capital,cap,risk,stop,target,threshold,auto=100000,35000,5.0,20,2.0,7,True
     else:
         capital=st.number_input('Paper capital ₹',min_value=10000,value=100000,step=10000)
         cap=st.number_input('Maximum premium per trade ₹',min_value=1000,value=35000,step=1000,max_value=35000)
-        risk=st.slider('Risk per trade %',0.5,5.0,1.0,0.5)
+        risk=st.slider('Risk per trade %',0.5,5.0,5.0,0.5)
         stop=st.slider('Premium stop-loss %',5,40,20,1)
         target=st.slider('Target multiple (R)',1.0,4.0,2.0,.5)
         threshold=st.slider('Minimum technical score / 8',5,8,7)
@@ -61,6 +61,12 @@ except Exception as e:
     st.stop()
 
 lookup={x['symbol']:x for x in all_u.to_dict('records')}
+priority=()
+if not worker_mode:
+    with st.sidebar:
+        priority=st.multiselect('Scan these symbols first',sorted(lookup),
+            default=[s for s in ('NIFTY','BANKNIFTY','RELIANCE','HDFCBANK') if s in lookup],
+            max_selections=20,help='These results appear first. All NSE F&O underlyings still get scanned.')
 ss=st.session_state
 ss.setdefault('runtime_owner',uuid.uuid4().hex)
 github=str(secrets.get('GITHUB_TOKEN',''))
@@ -77,9 +83,11 @@ def dashboard():
     configured_market=regular_day(clock,settings)
     grace=configured_market and (9,20)<=(clock.hour,clock.minute)<(15,35) and scheduled_slot(clock,settings) is None
     manual=st.button('Pull latest worker results' if worker_mode else '🔄 REFRESH NOW',
-                     type='primary',disabled=runtime.future is not None or grace)
-    data=runtime.step(clock,settings,manual,lookup,token,client,params,ss.runtime_owner)
+                     type='primary')
+    data=runtime.step(clock,settings,manual,lookup,token,client,params,ss.runtime_owner,priority)
     ss.live=data
+    if data.notice:st.caption(data.notice)
+    elif manual and grace and not worker_mode:st.caption('Waiting briefly for Dhan to publish the new closed candle.')
     state=('Scanning in background' if data.future is not None else
            data.status.get('state','Waiting for worker') if worker_mode else
            'Automatic 5-minute scans on' if scheduled_slot(clock,settings) is not None or grace else
@@ -96,7 +104,7 @@ def dashboard():
     if worker_mode and data.status:
         st.caption(f"Worker coverage {data.status.get('scanned','—')}/{data.status.get('requested','—')} · Worker entry setting: {'on' if data.policy.get('auto') else 'off / not reported'}")
     if not worker_mode and not data.controller:
-        st.caption('Another open dashboard session controls paper settings. This session shows the shared results.')
+        st.caption('Another dashboard session supplied the current paper settings. Refresh Now can take control for the next scan.')
     if data.error:
         st.error(data.error)
     if data.notes:
@@ -162,6 +170,10 @@ def scan_frame(rows):
         data.append(row)
     return pd.DataFrame(data)
 
+@st.cache_data(max_entries=12,show_spinner=False)
+def scanner_table(rows):
+    return scan_frame(rows).sort_values(['Qualified on candle','Score','Symbol'],ascending=[False,False,True])
+
 def scanner_style(df):
     checks={'✓':'Bullish','✗':'Bearish','—':'Neutral'}
     return styled_table(df,[(['Side','Setup bias'],df['Setup bias'])]+
@@ -171,7 +183,10 @@ def render_dashboard(tab):
     live=ss.live
     r,j=live.rows,live.journal
     now=datetime.now(IST)
-    table_live=regular_day(now,settings) and write_window(now) and live.slot is not None and live.slot==completed_slot(now)
+    visible_slot=live.preview_slot if live.partial else live.slot
+    table_live=regular_day(now,settings) and write_window(now) and visible_slot is not None and visible_slot==completed_slot(now)
+    if live.partial and tab != 3:
+        st.caption('Partial scan. Results update as Dhan responds. Paper entries are evaluated after the batch, not from this preview.')
     if tab in (1,2,4,5) and r and not table_live:
         st.caption('Showing the last published snapshot. It is not the current completed candle.')
     if tab == 0:
@@ -182,11 +197,11 @@ def render_dashboard(tab):
         m4.metric('Open paper trades',0 if j.empty else int((j.status=='OPEN').sum()))
         st.subheader('Intraday 5-minute scanner')
         if r:
-            df=scan_frame(r).sort_values(['Qualified on candle','Score','Symbol'],ascending=[False,False,True])
+            df=scanner_table(r).copy(deep=False)
             st.caption('✓ Passed · ✗ Not met · — Not verified. NIFTY tide is not scored. Historical rows are not live entries.')
             side_view=st.radio('Scanner side',('CE · Bullish','PE · Bearish'),horizontal=True)
             view=df[df['Side']==side_view[:2]]
-            symbols=st.multiselect('Filter displayed symbols (scan still covers all F&O)',sorted(df.Symbol.unique()))
+            symbols=st.multiselect('Filter displayed symbols (scan still covers all F&O)',sorted(lookup))
             if symbols:view=view[view.Symbol.isin(symbols)]
             qualified=st.checkbox('Only show qualifying setups',value=False)
             if qualified:view=view[view['Qualified on candle']]

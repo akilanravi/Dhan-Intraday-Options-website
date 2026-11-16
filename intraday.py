@@ -5,7 +5,7 @@ import pandas as pd
 from swing_core import DhanAPI, BASE, IST, ema, atr, parse_chain, select_contract
 
 
-def intraday_candles(api, x, days=8, since=None):
+def intraday_candles(api, x, days=8, since=None, through=None):
     end = datetime.now(IST)
     start = since if since is not None else end - timedelta(days=days)
     payload = {'securityId': str(x['sid']), 'exchangeSegment': x['segment'], 'instrument': x['instrument'],
