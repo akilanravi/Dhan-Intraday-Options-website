@@ -46,6 +46,7 @@ def read_csv(data):
     if not data.strip():
         return pd.DataFrame()
     frame=pd.read_csv(io.StringIO(data),dtype={'id':str}).fillna('')
+    if 'pnl' not in frame:frame['pnl']=''
     required={'status','symbol','side','opened_at','signal_candle','expiry','strike','lot','lots','cost','entry_premium'}
     if not required.issubset(frame.columns):
         raise ValueError('Paper journal is missing required columns')
@@ -119,8 +120,6 @@ def create_entries(j,api,lookup,signals,capital,cap,sl_pct,target_r,risk_pct,aut
         if not entry_window(clock) or not fresh_candle(s['candle'],clock):
             messages.append('Entry window or candle expired before a fill.');break
         if not j.empty:
-            if ((j.opened_at.astype(str).str[:10]==clock.date().isoformat())).sum()>=2:
-                messages.append('Daily paper-entry limit reached (2).');break
             if (j.status=='OPEN').sum()>=3:
                 messages.append('Open paper-position limit reached (3).');break
             if ((j.status=='OPEN')&(j.symbol==symbol)).any() or ((j.symbol==symbol)&(j.side==side)&(j.signal_candle==s['candle'])).any():
@@ -201,7 +200,7 @@ class CandleMemo:
         # Overlap one known bar to tolerate inclusive/exclusive fromDate boundaries.
         # Pin the request end to the completed candle; backfill the gap after downtime.
         since=max(cutoff,old.index[-1]) if old is not None and not old.empty else None
-        through=slot+BAR if slot is not None else None
+        through=slot+BAR if slot is not None and not force else None
         if since is not None and through is not None and since>=through:
             since=slot-BAR
         new=intraday_candles(api,x,since=since,through=through)

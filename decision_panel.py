@@ -36,10 +36,6 @@ def evaluate(idea, quote, policy, journal, now, extra=(), lookup_state=None):
     if journal_ok and 'symbol' in opened:
         add('Duplicate underlying', not opened.symbol.eq(idea['symbol']).any(), 'No second open trade in the same symbol.')
     if journal_ok and len(journal):
-        day=str(now.date())
-        if idea['mode']=='intraday' and 'opened_at' in journal:
-            count=journal.opened_at.astype(str).str.startswith(day).sum()
-            add('Daily entry limit', count<2, f'{count} / 2 entries today')
         if {'symbol','side','signal_candle' if idea['mode']=='intraday' else 'signal_date'} <= set(journal):
             key='signal_candle' if idea['mode']=='intraday' else 'signal_date'
             same=journal.symbol.eq(idea['symbol']) & journal.side.eq(idea['side']) & journal[key].astype(str).eq(idea['candle'])

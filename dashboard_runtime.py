@@ -9,7 +9,7 @@ from paper_engine import PaperStore, refresh_cycle, worker_pool
 from worker_store import cloud_journal
 from scan_clock import scheduled_slot, regular_day
 
-DASHBOARD_RUNTIME_API = 2
+DASHBOARD_RUNTIME_API = 3
 
 
 @st.cache_resource

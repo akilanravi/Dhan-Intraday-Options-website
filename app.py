@@ -11,8 +11,9 @@ from underlying_backtest import render_backtest
 from decision_panel import show_panel, load_quote, context, number
 from paper_engine import universe, fresh_candle
 import dashboard_runtime as scanner_runtime
-from scan_clock import scheduled_slot, regular_day, completed_slot, write_window
+from scan_clock import BAR, timestamp, scheduled_slot, regular_day, completed_slot, write_window
 from worker_store import enabled
+from paper_report import performance_by_symbol
 
 st.set_page_config(page_title='DHAN QUANT · INTRADAY',layout='wide',page_icon='📈')
 st.markdown('''<style>
@@ -29,9 +30,9 @@ h1{background:linear-gradient(90deg,#6ee7ff,#b69bff,#ff76c7);-webkit-background-
 
 st.title('DHAN QUANT · INTRADAY OPTIONS TERMINAL')
 st.caption('Dhan only · 5-minute completed candles · CE/PE · no Telegram · no real broker orders')
-st.caption('Build 5.1 · Fast Refresh · 5% default paper risk')
+st.caption('Build 5.2 · Five-minute candle view · No daily paper-entry cap')
 
-RUNTIME_API_REQUIRED=2
+RUNTIME_API_REQUIRED=3
 UPDATE_NOTE=('Scanner files are out of sync. Replace app.py and dashboard_runtime.py from the same ZIP '
              'in one commit, then use Manage app → Reboot app. Keep your existing secrets.')
 if getattr(scanner_runtime,'DASHBOARD_RUNTIME_API',None)!=RUNTIME_API_REQUIRED:
@@ -87,7 +88,6 @@ if getattr(runtime,'api_version',None)!=RUNTIME_API_REQUIRED:
     st.stop()
 
 
-@st.fragment(run_every=3)
 def dashboard():
     """Clock and publishing run even when the market-scanner tab is not selected."""
     clock=datetime.now(IST)
@@ -96,7 +96,6 @@ def dashboard():
     manual=st.button('Pull latest worker results' if worker_mode else '🔄 REFRESH NOW',
                      type='primary')
     data=runtime.step(clock,settings,manual,lookup,token,client,params,ss.runtime_owner,priority=priority)
-    ss.live=data
     if data.notice:st.caption(data.notice)
     elif manual and grace and not worker_mode:st.caption('Waiting briefly for Dhan to publish the new closed candle.')
     state=('Scanning in background' if data.future is not None else
@@ -104,9 +103,11 @@ def dashboard():
            'Automatic 5-minute scans on' if scheduled_slot(clock,settings) is not None or grace else
            'Waiting for the next regular NSE session / candle')
     st.caption(f"{state} · Full universe: {len(lookup)} NSE F&O underlyings including indices.")
-    end=(data.slot+pd.Timedelta(minutes=5)).strftime('%d %b %H:%M IST') if data.slot is not None else '—'
-    if data.rows and data.slot is None:
-        end=(pd.Timestamp(data.rows[0]['candle'])+pd.Timedelta(minutes=5)).strftime('%d %b %H:%M IST')+' (historical sample)'
+    end=candle_close(data.slot) if data.slot is not None else '—'
+    if scheduled_slot(clock,settings) is not None:
+        st.caption(f'Latest expected candle close: {candle_close(completed_slot(clock))}')
+    if data.partial and data.preview_slot is not None:
+        st.caption(f'Receiving candle closed at {candle_close(data.preview_slot)}. Missing symbols are not filled with older data.')
     checked=pd.Timestamp(data.stamp).tz_convert(IST).strftime('%d %b %H:%M:%S IST') if data.stamp else '—'
     st.caption(f'Published candle close: {end} · Last completed check: {checked}')
     if data.progress is not None:
@@ -122,6 +123,7 @@ def dashboard():
         with st.expander('Scan and paper-trading diagnostics',expanded=not data.rows):
             for note in data.notes[:40]:
                 st.text(note)
+    return data
 
 BIAS_COLORS = {
     'Bullish': ('#75f0bd', '#103b32'),
@@ -165,7 +167,14 @@ def candle_table(df):
 CHECKS = ('CPR trend','CPR breakout/retest','PDH / PDL','EMA 9/21','VWAP','RSI 14',
           'Supertrend 10,3','Volume 1.5x','NIFTY tide')
 
-def scan_frame(rows):
+def candle_range(value):
+    start=timestamp(value)
+    return f'{start:%d %b %H:%M}–{start+BAR:%H:%M} IST'
+
+def candle_close(value):
+    return f'{timestamp(value)+BAR:%d %b %H:%M} IST'
+
+def scan_frame(rows, candles=None):
     data=[]
     for x in rows:
         checks=x.get('tests',{})
@@ -176,60 +185,68 @@ def scan_frame(rows):
         for name in CHECKS:
             value=checks.get(name if name!='PDH / PDL' or name in checks else 'Camarilla/PDH-PDL')
             row[name]='✓' if value is True else '✗' if value is False else '—'
-        row.update({'Close':round(x['close'],2),'Candle (IST)':x['candle'],
+        raw=(candles or {}).get(x['symbol'])
+        bar=raw.iloc[-1] if raw is not None and not raw.empty and raw.index[-1]==timestamp(x['candle']) else {}
+        row.update({'Open':bar.get('Open'),'High':bar.get('High'),'Low':bar.get('Low'),
+                    'Close':round(x['close'],2),'Volume':bar.get('Volume'),
+                    'Candle close (IST)':candle_close(x['candle']),
+                    'Candle start (IST)':x['candle'],
                     'Exit ST (7,2)':x.get('exit_st'),'Reversal':x.get('reverse_now')})
         data.append(row)
     return pd.DataFrame(data)
 
-@st.cache_data(max_entries=12,show_spinner=False)
-def scanner_table(rows):
-    return scan_frame(rows).sort_values(['Qualified on candle','Score','Symbol'],ascending=[False,False,True])
+def scanner_table(rows,candles):
+    return scan_frame(rows,candles).sort_values(['Qualified on candle','Score','Symbol'],ascending=[False,False,True])
 
 def scanner_style(df):
     checks={'✓':'Bullish','✗':'Bearish','—':'Neutral'}
     return styled_table(df,[(['Side','Setup bias'],df['Setup bias'])]+
                         [([name],df[name].map(checks)) for name in CHECKS])
 
-def render_dashboard(tab):
-    live=ss.live
+def render_dashboard(tab,live):
     r,j=live.rows,live.journal
     now=datetime.now(IST)
     visible_slot=live.preview_slot if live.partial else live.slot
     table_live=regular_day(now,settings) and write_window(now) and visible_slot is not None and visible_slot==completed_slot(now)
     if live.partial and tab != 3:
         st.caption('Partial scan. Results update as Dhan responds. Paper entries are evaluated after the batch, not from this preview.')
-    if tab in (1,2,4,5) and r and not table_live:
-        st.caption('Showing the last published snapshot. It is not the current completed candle.')
+    if tab != 3 and r and not table_live:
+        st.caption('Showing the last available snapshot. These are not current live-entry signals.')
     if tab == 0:
         m1,m2,m3,m4=st.columns(4)
         m1.metric('Scanned symbols',len(set(x['symbol'] for x in r)))
         m2.metric('Eligible CE',sum(table_live and x['eligible'] and x['side']=='CE' for x in r))
         m3.metric('Eligible PE',sum(table_live and x['eligible'] and x['side']=='PE' for x in r))
         m4.metric('Open paper trades',0 if j.empty else int((j.status=='OPEN').sum()))
-        st.subheader('Intraday 5-minute scanner')
+        st.subheader('Latest completed 5-minute data')
         if r:
-            df=scanner_table(r).copy(deep=False)
+            df=scanner_table(r,live.candles)
             st.caption('✓ Passed · ✗ Not met · — Not verified. NIFTY tide is not scored. Historical rows are not live entries.')
-            side_view=st.radio('Scanner side',('CE · Bullish','PE · Bearish'),horizontal=True)
-            view=df[df['Side']==side_view[:2]]
+            side_view=st.radio('Scanner side',('Both','CE · Bullish','PE · Bearish'),horizontal=True,key='scanner_side_52')
+            view=df if side_view=='Both' else df[df['Side']==side_view[:2]]
             symbols=st.multiselect('Filter displayed symbols (scan still covers all F&O)',sorted(lookup))
-            if symbols:view=view[view.Symbol.isin(symbols)]
+            if symbols:
+                view=view[view.Symbol.isin(symbols)]
+                missing=sorted(set(symbols)-set(df.Symbol))
+                if missing:st.info('No candle in this snapshot for '+', '.join(missing))
             qualified=st.checkbox('Only show qualifying setups',value=False)
             if qualified:view=view[view['Qualified on candle']]
             if view.empty:
                 st.info('No rows for this view.')
             else:
                 st.dataframe(scanner_style(view),width='stretch',hide_index=True,
+                             column_order=['Symbol','Side','Candle close (IST)','Open','High','Low','Close','Volume',
+                                           'Score','Qualified on candle',*CHECKS,'Setup bias','Volume source','Candle start (IST)',
+                                           'Exit ST (7,2)','Reversal'],
                              column_config={'Symbol':st.column_config.TextColumn(pinned=True),
                                             'Close':st.column_config.NumberColumn(format='%.2f')})
             st.download_button('Download scanner CSV (both sides)',df.to_csv(index=False),'intraday_scanner.csv')
         else:st.info('Waiting for the first full-universe scan. In dashboard mode, Refresh Now can also load a historical preview.')
     if tab == 1:
         st.subheader('Eligible CE / PE signals')
-        card_side=st.radio('Signal cards side',('CE · Bullish','PE · Bearish'),horizontal=True)
-        now=datetime.now(IST)
-        eligible=sorted((x for x in r if table_live and x['side']==card_side[:2] and x['eligible']),key=lambda x:(-x['score'],x['symbol']))
-        if not eligible:st.info('No confirmed eligible signals for this side in the latest scan.')
+        card_side=st.radio('Signal cards side',('CE · Bullish','PE · Bearish'),horizontal=True,key='signal_cards_side_52')
+        eligible=sorted((x for x in r if x['side']==card_side[:2] and x['eligible']),key=lambda x:(-x['score'],x['symbol']))
+        if not eligible:st.info('No eligible signals for this side in the displayed candle snapshot.')
         for i in range(0,len(eligible),3):
             cols=st.columns(3)
             for col,x in zip(cols,eligible[i:i+3]):
@@ -239,7 +256,7 @@ def render_dashboard(tab):
                     st.markdown(f'''<div style="background:#10223a;border:2px solid {border};border-radius:17px;padding:18px;color:#eaf4ff">
                     <h3 style="color:{border}!important">{html.escape(x['symbol'])} · {x['side']} · {label}</h3>
                     <h2 style="color:#5de7ff!important">{x['score']}/8</h2><p>Underlying close ₹{x['close']:,.2f}</p>
-                    <small>{x['candle']}</small></div>''',unsafe_allow_html=True)
+                    <small>{candle_range(x['candle'])}</small></div>''',unsafe_allow_html=True)
                     with st.expander('Condition checklist'):
                         for name, value in x['tests'].items():
                             st.write(('✅' if value is True else '❌' if value is False else '🟡')+' '+name)
@@ -248,6 +265,7 @@ def render_dashboard(tab):
         if live.candles:
             symbol=st.selectbox('Instrument',list(live.candles),key='chart_symbol')
             d=live.candles[symbol].tail(90)
+            st.caption(f'Latest candle for {symbol} · {candle_range(d.index[-1])}')
             try:
                 import plotly.graph_objects as go
                 fig=go.Figure()
@@ -265,10 +283,13 @@ def render_dashboard(tab):
                 st.plotly_chart(fig,width='stretch')
             except ImportError:st.line_chart(d[['Close','ema9','ema21','vwap']])
             st.caption(LEGEND + ' · Candles compare Close to Open. Supertrend cells show the indicator’s own direction.')
-            st.dataframe(candle_table(d.tail(20)),width='stretch')
+            recent=d.tail(20).iloc[::-1].copy()
+            recent.insert(0,'Candle close (IST)',[candle_close(i) for i in recent.index])
+            st.dataframe(candle_table(recent),width='stretch',hide_index=True)
         else:st.info('Scan first to view candles.')
     if tab == 3:
         st.subheader('Automatic paper journal')
+        st.caption('No daily entry count cap. The 3-open-position and 35% total premium exposure limits still apply.')
         st.caption('Entry at Dhan ask, exits at observed Dhan bid. Prices are snapshots. Missed SL/target between refreshes cannot be reconstructed.')
         for note in live.notes[:15]:
             if 'paper' in note.lower() or any(x in note for x in ('SKIP','lookups','entries','candle expired','outside')):st.text(note)
@@ -278,8 +299,15 @@ def render_dashboard(tab):
             st.markdown('**Closed trades**');st.dataframe(j[j.status=='CLOSED'],width='stretch',hide_index=True)
             closed=j[j.status=='CLOSED'].copy()
             if len(closed):
-                p=pd.to_numeric(closed.pnl,errors='coerce').fillna(0)
-                a,b,c=st.columns(3);a.metric('Net P&L ₹',f'{p.sum():,.2f}');b.metric('Win rate',f'{(p>0).mean()*100:.1f}%');c.metric('Closed trades',len(closed))
+                p=pd.to_numeric(closed.pnl,errors='coerce').dropna()
+                a,b,c=st.columns(3);a.metric('Realized net P&L ₹',f'{p.sum():,.2f}');b.metric('Win rate',f'{(p>0).mean()*100:.1f}%' if len(p) else '—');c.metric('Closed trades',len(closed))
+            st.subheader('Paper performance by symbol and side')
+            st.caption('Date filter uses the entry session in IST. Realized P&L counts only closed trades and includes estimated charges. Open trades are counted separately.')
+            days=sorted(pd.to_datetime(j.opened_at,utc=True,errors='coerce',format='mixed').dt.tz_convert(IST).dt.strftime('%Y-%m-%d').dropna().unique(),reverse=True)
+            period=st.selectbox('Entry session',['All sessions',*days],key='paper_summary_session')
+            summary=performance_by_symbol(j,None if period=='All sessions' else period)
+            st.dataframe(summary,width='stretch',hide_index=True)
+            st.download_button('Download paper performance CSV',summary.to_csv(index=False),'paper_performance_by_symbol.csv')
             st.download_button('Download paper journal CSV',j.to_csv(index=False),'intraday_paper_trades.csv')
         if secrets.get('GITHUB_TOKEN') and live.gist and not secrets.get('INTRADAY_GIST_ID'):
             st.warning(f'Add this journal ID to Streamlit Secrets to reconnect after restart: INTRADAY_GIST_ID = "{live.gist}"')
@@ -348,23 +376,23 @@ def render_dashboard(tab):
                                        'End-of-day exit checks start at 15:20 IST; a valid bid is needed.'])
 
 
+PAGES=(
+    '1 · Market scanner','2 · Eligible signal cards','3 · Trade analysis',
+    '4 · Paper trading','5 · Conditions','6 · Trade Decision','7 · Call / Put Backtest',
+)
+
+
 @st.fragment(run_every=3)
-def dashboard_view(tab):
-    """Refresh live data views without rerunning the backtest widgets."""
-    render_dashboard(tab)
+def live_view(page):
+    """Use one snapshot and one render pass for the visible page."""
+    data=dashboard()
+    if page<6:
+        render_dashboard(page,data)
 
 
-dashboard()
-tabs = st.tabs([
-    '1 · Market scanner', '2 · Eligible signal cards', '3 · Trade analysis',
-    '4 · Paper trading', '5 · Conditions', '6 · Trade Decision',
-    '7 · Call / Put Backtest',
-],key='intraday_tabs',on_change='rerun')
-for tab_index, tab in enumerate(tabs):
-    if tab.open:
-        with tab:
-            if tab_index < 6:
-                dashboard_view(tab_index)
-            else:
-                st.caption('Backtests run on demand and are separate from the live five-minute cycle.')
-                render_backtest(all_u, token, client, DhanAPI, '5 min')
+page=st.radio('Dashboard view',PAGES,horizontal=True,key='intraday_view_52',label_visibility='collapsed')
+index=PAGES.index(page)
+live_view(index)
+if index==6:
+    st.caption('Backtests run on demand and are separate from the live five-minute cycle.')
+    render_backtest(all_u,token,client,DhanAPI,'5 min')
