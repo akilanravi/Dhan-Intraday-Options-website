@@ -12,11 +12,12 @@ from decision_panel import show_panel, load_quote, context, number
 from paper_engine import universe, fresh_candle
 import dashboard_runtime as scanner_runtime
 from scan_clock import BAR, timestamp, scheduled_slot, regular_day, completed_slot, write_window
-from worker_store import enabled
 from paper_report import performance_by_symbol
 from signal_history import times_for
+from dashboard_auth import require_password, is_authenticated, read_secret
 
 st.set_page_config(page_title='DHAN QUANT · INTRADAY',layout='wide',page_icon='📈')
+require_password('Dhan Intraday')
 st.markdown('''<style>
 .stApp{background:linear-gradient(145deg,#060b17,#101d35);color:#e9f3ff}
 h2,h3{color:#eaf4ff!important}p,label,.stMarkdown{color:#d6e6ff}
@@ -39,13 +40,14 @@ UPDATE_NOTE=('Scanner files are out of sync. Replace the project files together 
 if getattr(scanner_runtime,'DASHBOARD_RUNTIME_API',None)!=RUNTIME_API_REQUIRED:
     st.error(UPDATE_NOTE)
     st.stop()
-try: secrets=dict(st.secrets)
-except Exception: secrets={}
-worker_mode=enabled(secrets.get('PAPER_WORKER_MODE',os.getenv('PAPER_WORKER_MODE','')))
+secrets={key:read_secret(key) for key in ("GITHUB_TOKEN","INTRADAY_GIST_ID","NSE_CLOSED_DATES")}
+# This edition uses Streamlit as the only credential holder and scanner host.
+worker_mode=False
+token=read_secret('DHAN_ACCESS_TOKEN')
+client=read_secret('DHAN_CLIENT_ID')
 with st.sidebar:
     st.header('Dhan connection')
-    token=st.text_input('Access token',value=str(secrets.get('DHAN_ACCESS_TOKEN','')),type='password').strip()
-    client=st.text_input('Client ID',value=str(secrets.get('DHAN_CLIENT_ID','')),type='password').strip()
+    st.caption('Dhan credentials configured on server.' if token and client else 'Dhan credentials missing in Streamlit Secrets.')
     if worker_mode:
         st.caption('The independent worker owns scanning and paper entries. Edit worker.env to change its settings.')
         capital,cap,risk,stop,target,threshold,auto=100000,35000,5.0,20,2.0,7,True
@@ -61,7 +63,7 @@ with st.sidebar:
     st.caption('The legacy NIFTY tide condition is not scored.')
 
 if not worker_mode and (not token or not client):
-    st.warning('Enter DHAN_ACCESS_TOKEN and DHAN_CLIENT_ID in the sidebar or Streamlit Secrets.')
+    st.warning('The owner must configure DHAN_ACCESS_TOKEN and DHAN_CLIENT_ID in Streamlit Secrets.')
     st.stop()
 
 try:
@@ -83,7 +85,7 @@ github=str(secrets.get('GITHUB_TOKEN',''))
 gist=str(secrets.get('INTRADAY_GIST_ID',''))
 params=dict(threshold=threshold,capital=capital,cap=cap,stop=stop,target=target,risk=risk,auto=auto)
 settings={'NSE_CLOSED_DATES':secrets.get('NSE_CLOSED_DATES',os.getenv('NSE_CLOSED_DATES',''))}
-runtime=scanner_runtime.get_runtime((RUNTIME_API_REQUIRED,worker_mode,gist),worker_mode,github,gist,ss.runtime_owner)
+runtime=scanner_runtime.get_runtime((RUNTIME_API_REQUIRED,worker_mode,gist,hashlib.sha256((client+'|'+token).encode()).hexdigest()),worker_mode,github,gist,ss.runtime_owner)
 if getattr(runtime,'api_version',None)!=RUNTIME_API_REQUIRED:
     st.error(UPDATE_NOTE)
     st.stop()
@@ -406,6 +408,8 @@ PAGES=(
 @st.fragment(run_every=3)
 def live_view(page):
     """Use one snapshot and one render pass for the visible page."""
+    if not is_authenticated():
+        st.rerun()
     data=dashboard()
     if page<6:
         render_dashboard(page,data)

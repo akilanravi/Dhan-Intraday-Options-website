@@ -78,3 +78,7 @@ can run independently of the browser.
   For a tighter full-universe target, an always-on Dhan WebSocket candle
   aggregation service would be a separate deployment. No new paid tools or
   Yahoo data are used here.
+
+## Private Streamlit edition
+
+Follow START-HERE.txt in the delivery. Set APP_PASSWORD and both Dhan keys in Streamlit Secrets. This edition uses dashboard mode only. External-worker instructions below or above do not apply.
