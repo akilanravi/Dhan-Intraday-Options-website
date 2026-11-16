@@ -1,16 +1,16 @@
 """Dhan Intraday Options V1. Separate repository, paper-only, automatic in-session refresh."""
 import hashlib, io, math, os, time
-from threading import Lock
+from threading import Lock, local
 from collections import OrderedDict
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from datetime import datetime, timedelta
 from pathlib import Path
-from queue import SimpleQueue
 import pandas as pd
 import requests
 import streamlit as st
-from intraday import intraday_candles,enrich,signal,choose_option
+from intraday import intraday_candles,enrich,signal,choose_option,_daily_expiry
 from swing_core import DhanAPI,load_universe,IST
+from scan_clock import BAR, fresh_candle, write_window, entry_window
 
 class PaperStore:
     """Dedicated intraday journal; private Gist recommended for Streamlit persistence."""
@@ -22,9 +22,14 @@ class PaperStore:
             r=requests.get(f'https://api.github.com/gists/{self.gist}',headers=self.headers,timeout=20);r.raise_for_status()
             f=r.json()['files'].get('intraday_paper_trades.csv')
             if f:
-                data=f.get('content') if not f.get('truncated') else requests.get(f['raw_url'],headers=self.headers,timeout=20).text
-                return pd.read_csv(io.StringIO(data)).fillna('')
-        return pd.read_csv(self.path).fillna('') if self.path.exists() else pd.DataFrame()
+                if f.get('truncated'):
+                    raw=requests.get(f['raw_url'],headers=self.headers,timeout=20)
+                    raw.raise_for_status()
+                    data=raw.text
+                else: data=f.get('content','')
+                return read_csv(data)
+            return pd.DataFrame()
+        return read_csv(self.path.read_text(encoding='utf-8')) if self.path.exists() else pd.DataFrame()
     def save(self,d):
         data=d.to_csv(index=False);tmp = self.path.with_suffix('.tmp')
         tmp.write_text(data, encoding='utf-8'); os.replace(tmp, self.path)
@@ -37,7 +42,17 @@ class PaperStore:
         r.raise_for_status()
         return f'Saved to Gist {self.gist}'
 
-@st.cache_data(ttl=86400,show_spinner=False)
+def read_csv(data):
+    if not data.strip():
+        return pd.DataFrame()
+    frame=pd.read_csv(io.StringIO(data),dtype={'id':str}).fillna('')
+    required={'status','symbol','side','opened_at','signal_candle','expiry','strike','lot','lots','cost','entry_premium'}
+    if not required.issubset(frame.columns):
+        raise ValueError('Paper journal is missing required columns')
+    return frame
+
+
+@st.cache_data(ttl=14400,show_spinner=False)
 def universe():
     stocks,indices=load_universe()
     return pd.concat([indices,stocks],ignore_index=True).drop_duplicates('symbol')
@@ -51,11 +66,12 @@ def quote(api,x,contract):
     if not (math.isfinite(price) and price>0):raise ValueError('No executable bid price')
     return price
 
-def update_positions(j,api,lookup,signals,sl_pct,target_r,refresh_time):
+def update_positions(j,api,lookup,signals,sl_pct,target_r,clock_fn=lambda:datetime.now(IST)):
     if j.empty:return j,[]
     messages=[]
     for i,t in j[j.status=='OPEN'].iterrows():
         symbol=str(t.symbol)
+        if not write_window(clock_fn()):break
         if symbol not in lookup:messages.append(f'{symbol}: instrument unavailable');continue
         x=lookup[symbol]
         try:
@@ -66,68 +82,79 @@ def update_positions(j,api,lookup,signals,sl_pct,target_r,refresh_time):
             current=signals.get((symbol,side),{})
             # No future-looking execution: first observed quote is a snapshot, not a stop-fill guarantee.
             opposite=signals.get((symbol,'PE' if side=='CE' else 'CE'),{})
-            reversal=bool(current.get('reverse_now')) or bool(opposite.get('eligible'))
+            reversal=(bool(current.get('reverse_now')) and fresh_candle(current.get('candle'),clock_fn())) or (bool(opposite.get('eligible')) and fresh_candle(opposite.get('candle'),clock_fn()))
             # End of day flat; 15:20 IST cut-off
-            clock=datetime.now(IST)
-            if not ((9,15)<=(clock.hour,clock.minute)<(15,30)) or clock.weekday()>=5:
+            clock=clock_fn()
+            if not write_window(clock):
                 messages.append(f'{symbol}: quote arrived outside market hours; left OPEN')
                 continue
             eod=(clock.hour,clock.minute)>=(15,20) or str(t.opened_at)[:10] != clock.date().isoformat()
             reason='TARGET' if live>=target else 'STOP' if live<=stop else 'REVERSAL' if reversal else 'EOD' if eod else ''
-            j.at[i,'last_bid']=live;j.at[i,'last_checked']=refresh_time
+            observed=clock.isoformat(timespec='seconds')
+            j.at[i,'last_bid']=live;j.at[i,'last_checked']=observed
             if reason:
                 qty=int(float(t.lot))*int(float(t.lots))
                 # Estimated friction: ₹20 brokerage each side, sell-side STT and other charges approximated.
                 gross=(live-entry)*qty; charges=40+0.002*(entry+live)*qty
                 j.at[i,'pnl']=round(gross-charges,2)
-                j.at[i,'status']='CLOSED';j.at[i,'exit_premium']=live;j.at[i,'exit_reason']=reason;j.at[i,'closed_at']=refresh_time
+                j.at[i,'status']='CLOSED';j.at[i,'exit_premium']=live;j.at[i,'exit_reason']=reason;j.at[i,'closed_at']=observed
                 messages.append(f'{symbol} {side}: closed on {reason} at bid ₹{live:.2f} (snapshot)')
         except Exception as e:messages.append(f'{symbol}: quote unavailable — {str(e)[:90]}; left OPEN')
     return j,messages
 
-def create_entries(j,api,lookup,signals,capital,cap,sl_pct,target_r,risk_pct,auto,now):
+def create_entries(j,api,lookup,signals,capital,cap,sl_pct,target_r,risk_pct,auto,
+                   clock_fn=lambda:datetime.now(IST)):
     messages=[]
-    if not auto:return j,messages
-    clock=datetime.now(IST)
-    if clock.weekday()>=5 or not ((9,45)<=(clock.hour,clock.minute)<(15,10)):
+    clock=clock_fn()
+    if not auto:return j,['Automatic entries are paused.']
+    if not entry_window(clock):
         return j,['Outside 09:45–15:10 IST: no new entries.']
-    opened=0
-    for (symbol,side),s in sorted(signals.items(),key=lambda z:-z[1]['score']):
-        clock=datetime.now(IST)
-        if (clock.hour,clock.minute)>=(15,10) or opened>=2:break
-        if not s['eligible'] or not fresh_candle(s['candle'],clock):continue
-        if not j.empty and ((j.status=='OPEN')&(j.symbol==symbol)).any():continue
-        if not j.empty and ((j.symbol==symbol)&(j.side==side)&(j.signal_candle==s['candle'])).any():continue
-        if not j.empty and (j.status=='OPEN').sum()>=3:break
-        if not j.empty and ((j.opened_at.astype(str).str[:10]==clock.date().isoformat())).sum()>=2:break
+    candidates=[(key,s) for key,s in signals.items() if s['eligible'] and fresh_candle(s['candle'],clock)]
+    if not candidates:
+        return j,['No fresh CE/PE setup passed the technical filters.']
+    checked=opened=0
+    stop_lookups_at=time.monotonic()+48
+    for (symbol,side),s in sorted(candidates,key=lambda z:(-z[1]['score'],*z[0])):
+        clock=clock_fn()
+        if not entry_window(clock) or not fresh_candle(s['candle'],clock):
+            messages.append('Entry window or candle expired before a fill.');break
+        if not j.empty:
+            if ((j.opened_at.astype(str).str[:10]==clock.date().isoformat())).sum()>=2:
+                messages.append('Daily paper-entry limit reached (2).');break
+            if (j.status=='OPEN').sum()>=3:
+                messages.append('Open paper-position limit reached (3).');break
+            if ((j.status=='OPEN')&(j.symbol==symbol)).any() or ((j.symbol==symbol)&(j.side==side)&(j.signal_candle==s['candle'])).any():
+                continue
+        if checked>=10 or time.monotonic()>=stop_lookups_at:
+            messages.append('Quote-check time/candidate limit reached for this cycle.');break
         x=lookup[symbol]
+        exposure=0 if j.empty else pd.to_numeric(j.loc[j.status=='OPEN','cost'],errors='coerce').sum()
+        effective_cap=min(cap,capital*risk_pct/sl_pct,capital*.35-exposure)
+        if effective_cap<=0:
+            messages.append('No remaining premium budget under the risk/exposure limits.');break
         try:
-            opt,why=choose_option(api,x,side,capital,cap)
-            clock=datetime.now(IST)
-            if (clock.hour,clock.minute)>=(15,10) or not fresh_candle(s['candle'],clock):continue
-            if opt is None:messages.append(f'{symbol} {side}: SKIP — {why[:90]}');continue
-            risk=opt['premium']*opt['lot']*sl_pct/100
-            if risk>capital*risk_pct/100:
-                messages.append(f'{symbol} {side}: SKIP — one-lot stop risk ₹{risk:,.0f} exceeds budget');continue
-            exposure=0 if j.empty else pd.to_numeric(j.loc[j.status=='OPEN','cost'],errors='coerce').sum()
-            if exposure+opt['premium']*opt['lot']>capital*.35:
-                messages.append(f'{symbol} {side}: SKIP — 35% portfolio premium cap');continue
+            checked+=1
+            opt,why=choose_option(api,x,side,capital,effective_cap)
+            clock=clock_fn()
+            if not entry_window(clock) or not fresh_candle(s['candle'],clock):
+                messages.append(f'{symbol} {side}: candle expired before the quote could be used.');break
+            if opt is None:messages.append(f'{symbol} {side}: SKIP — {why}');continue
+            cost=opt['premium']*opt['lot']
+            if not math.isfinite(cost) or not 0<cost<=effective_cap:
+                messages.append(f'{symbol} {side}: SKIP — one-lot premium exceeds effective cap');continue
             row={'id':f'{clock:%Y%m%d%H%M%S}-{symbol}-{side}','symbol':symbol,'side':side,'status':'OPEN',
                  'signal_candle':s['candle'],'score':s['score'],'opened_at':clock.isoformat(timespec='seconds'),'closed_at':'',
                  'contract':opt['contract'],'expiry':opt['expiry'],'strike':opt['strike'],
                  'lot':opt['lot'],'lots':1,'entry_premium':opt['premium'],'last_bid':opt['bid'],
-                 'cost':opt['premium']*opt['lot'],'stop_premium':opt['premium']*(1-sl_pct/100),
+                 'cost':cost,'stop_premium':opt['premium']*(1-sl_pct/100),
                  'target_premium':opt['premium']*(1+sl_pct/100*target_r),
-                 'last_checked':now,'exit_premium':'','exit_reason':'','pnl':''}
+                 'last_checked':clock.isoformat(timespec='seconds'),'exit_premium':'','exit_reason':'','pnl':''}
             j=pd.concat([j,pd.DataFrame([row])],ignore_index=True)
             opened+=1;messages.append(f"PAPER OPEN {symbol} {side} {opt['contract']} @ ask ₹{opt['premium']:.2f}")
-        except Exception as e:messages.append(f'{symbol} {side}: Dhan option lookup failed — {str(e)[:110]}')
+        except Exception as e:
+            messages.append(f'{symbol} {side}: Dhan option lookup failed — {str(e)[:150]}')
+    messages.insert(0, f'{len(candidates)} fresh eligible setups · {checked} option lookups · {opened} paper entries.')
     return j,messages
-
-def fresh_candle(candle, clock):
-    start=pd.Timestamp(candle)
-    now=pd.Timestamp(clock)
-    return start.date()==now.date() and now-pd.Timedelta(minutes=10)<start<=now-pd.Timedelta(minutes=5)
 
 
 @st.cache_resource
@@ -135,112 +162,162 @@ def worker_pool():
     return ThreadPoolExecutor(max_workers=4, thread_name_prefix='intraday')
 
 
-def completed_slot(clock):
-    t=pd.Timestamp(clock)
-    return t.floor('5min')-pd.Timedelta(minutes=5)
+class FastDhan(DhanAPI):
+    def __init__(self, token, client):
+        super().__init__(token,client)
+        self.timeout=(3.05,5)
+        self.attempts=2
+        self.account=hashlib.sha256((str(client)+'|'+token).encode()).digest()
 
-def in_market(clock):
-    return clock.weekday()<5 and (9,15)<=(clock.hour,clock.minute)<(15,30)
+    def nearest_expiry(self,sid,segment,day):
+        key=(self.account,sid,segment,day)
+        with _EXP_LOCK:
+            if key in _EXPIRIES:return _EXPIRIES[key]
+        exp=_daily_expiry(self,sid,segment,day)
+        if exp is not None:
+            with _EXP_LOCK:
+                _EXPIRIES[key]=exp
+                if len(_EXPIRIES)>1000:_EXPIRIES.pop(next(iter(_EXPIRIES)))
+        return exp
+
+_EXP_LOCK=Lock()
+_EXPIRIES={}
+
 
 class CandleMemo:
+    """Cache warm history, request only the recent tail for each new candle."""
     def __init__(self):
         self.lock=Lock()
         self.data=OrderedDict()
 
-    def load(self, account, api, x):
-        key=(account,str(x['sid']),x['segment'],x['instrument'])
-        clock=datetime.now(IST)
+    def load(self, api, x, slot, force=False, clock_fn=lambda:datetime.now(IST)):
+        key=(api.account,str(x['sid']),x['segment'],x['instrument'])
+        clock=clock_fn()
+        cutoff=clock-timedelta(days=8)
         with self.lock:
-            hit=self.data.get(key)
-            if hit is not None:
-                stamp,d=hit
-                slot=completed_slot(clock)
-                valid=(d.index[-1]==slot and stamp.date()==clock.date() if in_market(clock)
-                       else not in_market(stamp) and stamp.date()==clock.date() and
-                            (clock-stamp).total_seconds()<900)
-                if valid:
-                    self.data.move_to_end(key)
-                    return d
-        d=enrich(intraday_candles(api,x))
+            old=self.data.get(key)
+        if old is not None and not force and slot is not None and slot in old.index:
+            return old.loc[(old.index>=cutoff)&(old.index<=slot)]
+        since=max(cutoff,old.index[-1]-BAR) if old is not None and not old.empty else None
+        new=intraday_candles(api,x,since=since)
+        raw=pd.concat([old,new]) if old is not None else new
+        raw=raw[~raw.index.duplicated(keep='last')].sort_index().loc[lambda d:d.index>=cutoff]
+        # Suppress pre-open/after-hours records, which would corrupt VWAP and prior-day levels.
+        raw=raw.between_time('09:15','15:25')
+        if raw.empty:raise ValueError('No completed candles returned')
         with self.lock:
-            self.data[key]=(clock,d)
-            self.data.move_to_end(key)
-            while len(self.data)>500:self.data.popitem(last=False)
-        return d
+            current=self.data.get(key)
+            if current is None or raw.index[-1]>=current.index[-1]:
+                self.data[key]=raw
+                self.data.move_to_end(key)
+                while len(self.data)>750:self.data.popitem(last=False)
+        return raw if slot is None else raw.loc[raw.index<=slot]
 
 _MEMO=CandleMemo()
 
-def refresh_cycle(token,client,lookup,selected,j,threshold,capital,cap,stop,target,risk,auto,store,dirty,progress=None,journal_ready=True):
-    """Worker has no Streamlit UI or session-state calls."""
-    api=DhanAPI(token,client)
-    results=[]; candles={}; errors=[]
-    blocked=False
-    account=hashlib.sha256(token.encode()).digest()
-    attempted=0
-    successful=0
-    def fetch_symbol(symbol):
-        # Each thread owns its HTTP session; Dhan's existing limiter is shared.
-        local=DhanAPI(token,client)
-        with local.session:
-            return _MEMO.load(account,local,lookup[symbol])
 
-    def record(symbol, fetch):
-        nonlocal blocked, attempted, successful
-        attempted += 1
+def refresh_cycle(token,client,lookup,selected,j,threshold,capital,cap,stop,target,risk,auto,store,dirty,
+                  progress=None,journal_ready=True,slot=None,allow_trades=True,
+                  clock_fn=lambda:datetime.now(IST)):
+    """Pin all scores to one candle. Prioritize exits, then rank the complete batch."""
+    started=time.monotonic()
+    j=j.copy(deep=True)
+    results={}; candles={}; errors=[]
+    blocked=False
+    attempted=successful=0
+    selected=list(dict.fromkeys(selected))
+    selected_set=set(selected)
+    workers=local()
+    sessions=[]
+    session_lock=Lock()
+
+    def fetch_symbol(symbol,retry=False):
+        if not hasattr(workers,'api'):
+            workers.api=FastDhan(token,client)
+            with session_lock:sessions.append(workers.api.session)
+        api=workers.api
+        x=lookup[symbol]
+        raw=_MEMO.load(api,x,slot,force=retry,clock_fn=clock_fn)
+        if slot is not None and (raw.empty or raw.index[-1]!=slot):
+            return None, []
+        if x['instrument']=='INDEX' and raw.Volume.tail(21).sum()<=0 and str(x.get('fut_sid','')).isdigit():
+            try:
+                fut=_MEMO.load(api,{'sid':x['fut_sid'],'segment':'NSE_FNO','instrument':'FUTIDX'},slot,force=retry,clock_fn=clock_fn)
+                raw=raw.assign(Volume=fut.Volume.reindex(raw.index))
+                raw.attrs['volume_source']='NSE index futures proxy'
+            except Exception:
+                raw=raw.copy();raw.attrs['volume_source']='Index volume unavailable'
+        elif x['instrument']=='INDEX':
+            raw=raw.copy()
+            raw.attrs['volume_source']='Index volume unavailable' if raw.Volume.tail(21).sum()<=0 else 'Dhan index'
+        frame=enrich(raw)
+        return frame, signal(frame,symbol,threshold)
+
+    delayed=[]
+    def record(symbol,fetch,retry=False):
+        nonlocal blocked,attempted,successful
+        if not retry:attempted+=1
         try:
-            d=fetch()
-            rows=signal(d,symbol,threshold)
-            if symbol in selected_set:candles[symbol]=d
-            results.extend(rows)
-            successful += 1
+            d,rows=fetch()
+            if d is None:
+                if not retry:delayed.append(symbol)
+                else:errors.append(f'{symbol}: Dhan did not return the scheduled closed candle')
+            else:
+                if symbol in selected_set:candles[symbol]=d.tail(90).copy()
+                results[symbol]=rows
+                successful+=1
         except Exception as e:
-            msg=str(e)[:230]
+            msg=str(e)[:210]
             errors.append(f'{symbol}: {msg}')
             blocked=blocked or any(code in msg for code in ('DH-901','DH-902','HTTP 401','HTTP 403'))
-        if progress is not None:
-            progress.put((attempted,successful,symbol,errors[-1] if errors else ''))
+        if progress is not None:progress.put((attempted,successful,symbol,errors[-1] if errors else ''))
 
-    def scan_symbol(symbol):
-        record(symbol, lambda: _MEMO.load(account,api,lookup[symbol]))
-
-    def within_market(clock):
-        return (9,15)<= (clock.hour,clock.minute) < (15,30) and clock.weekday()<5
-
-    # Check exits before scanning the rest of the watchlist.
-    open_symbols=set() if j.empty else set(j.loc[j.status=='OPEN','symbol'])
     old=j.copy(deep=True)
+    open_symbols=set() if j.empty else set(j.loc[j.status=='OPEN','symbol'])
     exits=[]; entries=[]
-    selected_set=set(selected)
-    for symbol in sorted(open_symbols):
-        scan_symbol(symbol)
-        if blocked:break
-    clock=datetime.now(IST)
-    now=clock.isoformat(timespec='seconds')
-    if within_market(clock) and journal_ready and not blocked:
-        smap={(r['symbol'],r['side']):r for r in results if fresh_candle(r['candle'],clock)}
-        j,exits=update_positions(j,api,lookup,smap,stop,target,now)
-    elif open_symbols and not within_market(clock):
-        errors.append('Outside market hours: open paper positions are not filled using closing quotes.')
-    remaining=[symbol for symbol in dict.fromkeys(selected) if symbol not in open_symbols]
-    if remaining and not blocked and not open_symbols:
-        scan_symbol(remaining.pop(0))  # catch credentials failures before sending a batch
-    if remaining and not blocked:
-        from concurrent.futures import as_completed
-        with ThreadPoolExecutor(max_workers=3,thread_name_prefix='dhan-candles') as pool:
-            for offset in range(0,len(remaining),3):
-                if blocked:break
-                pending={pool.submit(fetch_symbol,s):s for s in remaining[offset:offset+3]}
-                for future in as_completed(pending):
-                    record(pending[future],future.result)
-    clock=datetime.now(IST)
-    now=clock.isoformat(timespec='seconds')
-    priority={symbol:i for i,symbol in enumerate(dict.fromkeys([*sorted(open_symbols),*selected]))}
-    results.sort(key=lambda row:(priority.get(row['symbol'],len(priority)),row['side']))
-    if within_market(clock) and journal_ready and not blocked:
-        entries_map={(r['symbol'],r['side']):r for r in results if r['symbol'] in selected
-                     and fresh_candle(r['candle'],clock)}
-        j,entries=create_entries(j,api,lookup,entries_map,capital,cap,stop,target,risk,auto and not dirty,now)
-    if blocked:errors.append('Scan stopped early because Dhan rejected authentication or data access.')
+    ordered=list(dict.fromkeys([*sorted(open_symbols & lookup.keys()),*selected]))
+    trade_api=FastDhan(token,client)
+    with trade_api.session:
+        try:
+            with ThreadPoolExecutor(max_workers=10,thread_name_prefix='dhan-candles') as pool:
+                priority=[s for s in ordered if s in open_symbols and s in lookup] or ordered[:1]
+                def run_batch(symbols,retry=False):
+                    pending={}
+                    todo=iter(symbols)
+                    def refill():
+                        while len(pending)<10 and not blocked and time.monotonic()-started<155:
+                            sym=next(todo,None)
+                            if sym is None:break
+                            pending[pool.submit(fetch_symbol,sym,retry)]=sym
+                    refill()
+                    while pending:
+                        done,_=wait(pending,return_when=FIRST_COMPLETED)
+                        for f in done:record(pending.pop(f),f.result,retry)
+                        refill()
+                run_batch(priority)
+                clock=clock_fn()
+                if write_window(clock) and allow_trades and journal_ready and open_symbols:
+                    smap={(r['symbol'],r['side']):r for rows in results.values() for r in rows if fresh_candle(r['candle'],clock)}
+                    j,exits=update_positions(j,trade_api,lookup,smap,stop,target,clock_fn)
+                priority_set=set(priority)
+                run_batch([s for s in ordered if s not in priority_set])
+                run_batch(delayed.copy(),retry=True)
+        finally:
+            for session in sessions:session.close()
+        clock=clock_fn()
+        out=[r for sym in selected for r in results.get(sym,[])]
+        wanted=len(ordered)
+        summary=(f'{successful}/{wanted} symbols returned the requested candle · '
+                 f'{attempted} attempted · {time.monotonic()-started:.1f} seconds (candle scan and exit checks).')
+        if attempted<wanted and not blocked:errors.append('Candle scan time budget reached. Unfinished symbols will be checked on the next candle.')
+        if blocked:errors.insert(0,'Dhan rejected authentication or data access. Check token and Data API entitlement.')
+        if not journal_ready:entries=['Paper journal unavailable. Scanning continues, but simulation is paused.']
+        elif not allow_trades:entries=['This is a read-only historical scan.']
+        elif dirty:entries=['Paper journal has an unsaved update. New entries paused until it is saved.']
+        elif not blocked:
+            entries_map={(r['symbol'],r['side']):r for r in out if fresh_candle(r['candle'],clock)}
+            j,entries=create_entries(j,trade_api,lookup,entries_map,capital,cap,stop,target,risk,
+                                     auto,clock_fn)
     dirty=dirty or not j.equals(old)
     if dirty:
         try:
@@ -248,6 +325,5 @@ def refresh_cycle(token,client,lookup,selected,j,threshold,capital,cap,stop,targ
             dirty=False
         except Exception as e:
             errors.append(f'Journal save failed: {e}. New entries paused until retry succeeds.')
-    return ([r for r in results if r['symbol'] in selected],candles,j,errors+exits+entries,store.gist,dirty,now)
-
-
+    stamp=clock_fn().isoformat(timespec='seconds')
+    return (out,candles,j,[summary,*exits,*entries,*errors],store.gist,dirty,stamp)

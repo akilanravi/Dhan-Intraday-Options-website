@@ -132,6 +132,8 @@ class DhanAPI:
         if not token:
             raise ValueError('Dhan access token is required')
         self.client_id = str(client_id or '').strip()
+        self.timeout = 25
+        self.attempts = 4
         self.session = requests.Session()
         self.session.headers.update({'access-token': token.strip(), 'Content-Type': 'application/json',
                                      'Accept': 'application/json'})
@@ -162,15 +164,16 @@ class DhanAPI:
     def _post(self, path, payload, limiter=DATA_LIMITER, with_client=False):
         headers = {'client-id': self.client_id} if (with_client and self.client_id) else {}
         last = ''
-        for attempt in range(4):
+        for attempt in range(self.attempts):
             limiter.wait()
             try:
-                r = self.session.post(BASE + path, json=payload, headers=headers, timeout=25)
+                r = self.session.post(BASE + path, json=payload, headers=headers, timeout=self.timeout)
             except requests.RequestException as e:
                 last = f'network error: {e}'
-                time.sleep(1.5 * (attempt + 1))
+                if attempt + 1 < self.attempts:
+                    time.sleep(1.5 * (attempt + 1))
                 continue
-            if r.status_code in (429, 500, 502, 503, 504) and attempt < 3:
+            if r.status_code in (429, 500, 502, 503, 504) and attempt + 1 < self.attempts:
                 last = f'HTTP {r.status_code}'
                 time.sleep(2.5 * (attempt + 1))
                 continue
@@ -309,7 +312,7 @@ def build_universe(master):
         m['_' + c] = m[c].fillna('').astype(str).str.upper().str.strip()
     nse = m['_EXCH_ID'].eq('NSE') | m['_SEGMENT'].str.contains('NSE')
     inst = m['_INSTRUMENT']
-    today = pd.Timestamp.now().normalize() - timedelta(days=1)
+    today = pd.Timestamp.now(tz=IST).tz_localize(None).normalize()
 
     # ---- stock futures define the F&O stock list
     fut = m[nse & (inst.str.contains('FUTSTK') | ((inst == 'FUT') & m['_SEGMENT'].str.contains('FNO|F&O|DERIV|^D$')))].copy()
@@ -319,10 +322,10 @@ def build_universe(master):
         fut['key'] = fut['UNDERLYING_SYMBOL'].fillna('').str.upper().str.strip()
     else:
         fut['key'] = fut['SYMBOL_NAME'].fillna('').str.upper().str.replace(r'[- ]?\d{2}[A-Z]{3}FUT$', '', regex=True).str.strip()
-    fut = fut[~fut['key'].str.contains(r'TEST|DUMMY|MOCK', case=False, na=False)]
+    fut = fut[~fut['key'].str.fullmatch(r'(?:TEST|DUMMY|MOCK)(?:[-_0-9].*)?', na=False)]
     live = fut[fut['EXP'].isna() | (fut['EXP'] >= today)].sort_values('EXP')
     lot_map = live.groupby('key')['LOT'].first().to_dict()
-    keys = set(fut['key']) - {''}
+    keys = set(live['key']) - {''}
 
     # ---- spot equity IDs (candles must use the NSE_EQ id, not the futures id)
     eq = m[(m['_EXCH_ID'].eq('NSE') | m['_SEGMENT'].eq('NSE_EQ')) &
@@ -330,6 +333,13 @@ def build_universe(master):
     eq['key'] = eq['SYMBOL_NAME'].fillna('').str.upper().str.strip()
     if 'UNDERLYING_SYMBOL' in eq.columns:
         eq['key'] = eq['UNDERLYING_SYMBOL'].where(eq['UNDERLYING_SYMBOL'].fillna('').ne(''), eq['key']).astype(str).str.upper().str.strip()
+    eq['SECURITY_ID'] = eq['SECURITY_ID'].astype(str).str.replace(r'\.0$', '', regex=True)
+    if 'UNDERLYING_SECURITY_ID' in live:
+        by_id = live.assign(_underlying_id=live['UNDERLYING_SECURITY_ID'].fillna('').astype(str)
+                            .str.replace(r'\.0$', '', regex=True))
+        by_id = by_id[by_id['_underlying_id'].str.fullmatch(r'\d+') & by_id['key'].ne('')]
+        id_to_symbol = by_id.drop_duplicates('_underlying_id').set_index('_underlying_id')['key']
+        eq['key'] = eq['SECURITY_ID'].map(id_to_symbol).fillna(eq['key'])
     eq = eq[eq['key'].isin(keys)]
     if 'SERIES' in eq.columns:
         eq = eq[eq['SERIES'].fillna('EQ').astype(str).str.upper().isin(['EQ', ''])]
@@ -337,8 +347,8 @@ def build_universe(master):
     stocks = pd.DataFrame({'symbol': eq['key'], 'sid': eq['SECURITY_ID'].astype(str).str.replace(r'\.0$', '', regex=True),
                            'segment': 'NSE_EQ', 'instrument': 'EQUITY'})
     stocks['lot'] = stocks['symbol'].map(lot_map)
-    stocks = stocks[stocks['sid'].str.fullmatch(r'\d+') & stocks['symbol'].str.fullmatch(r'[A-Z0-9&._-]{2,40}')]
-    stocks = stocks[~stocks['symbol'].str.contains(r'TEST|DUMMY|MOCK', case=False)].sort_values('symbol').reset_index(drop=True)
+    stocks = stocks[stocks['sid'].str.fullmatch(r'\d+') & stocks['symbol'].str.fullmatch(r'[A-Z0-9&._-]{1,40}')]
+    stocks = stocks.sort_values('symbol').reset_index(drop=True)
     if stocks.empty:
         raise ValueError(f'Found {len(keys)} F&O symbols but no matching NSE equity IDs.')
 
@@ -356,7 +366,7 @@ def build_universe(master):
     return stocks, pd.DataFrame(rows)
 
 
-@st.cache_data(ttl=86400, show_spinner=False)
+@st.cache_data(ttl=14400, show_spinner=False)
 def load_universe():
     return build_universe(read_instrument_master())
 
@@ -624,7 +634,7 @@ def select_contract(df, side, spot, p):
 
     def good(r):
         if not (p['delta_lo'] <= r['|delta|'] <= p['delta_hi']): return False
-        if pd.isna(r['spread %']) or r['spread %'] > p['max_spread']: return False
+        if pd.isna(r['spread %']) or not 0 <= r['spread %'] <= p['max_spread']: return False
         return r.oi > 0 and r.volume > 0
     ok = cands[cands.apply(good, axis=1)] if len(cands) else cands
     if ok.empty:
@@ -635,6 +645,11 @@ def select_contract(df, side, spot, p):
             if not (r.oi > 0 and r.volume > 0): why.append('no OI/volume')
             reasons.append(f"{r['where']} {r.strike:g}: " + ', '.join(why))
         return None, cands, 'No ATM/1-ITM strike passes delta/spread/liquidity -> ' + ' | '.join(reasons)
+    if 'max_ask' in p:
+        cheapest = float(ok.ask.min())
+        ok = ok[ok.ask.le(p['max_ask'])]
+        if ok.empty:
+            return None, cands, f'Cheapest liquid one-lot contract costs ₹{cheapest*p["lot"]:,.0f} (effective cap ₹{p["max_ask"]*p["lot"]:,.0f})'
     best = ok.iloc[(ok['|delta|'] - 0.575).abs().argsort()[:1]].iloc[0]
     return best, cands, ''
 

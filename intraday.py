@@ -5,9 +5,9 @@ import pandas as pd
 from swing_core import DhanAPI, BASE, IST, ema, atr, parse_chain, select_contract
 
 
-def intraday_candles(api, x, days=8):
+def intraday_candles(api, x, days=8, since=None):
     end = datetime.now(IST)
-    start = end - timedelta(days=days)
+    start = since if since is not None else end - timedelta(days=days)
     payload = {'securityId': str(x['sid']), 'exchangeSegment': x['segment'], 'instrument': x['instrument'],
                'interval': '5', 'oi': False, 'fromDate': start.strftime('%Y-%m-%d %H:%M:%S'),
                'toDate': end.strftime('%Y-%m-%d %H:%M:%S')}
@@ -52,7 +52,7 @@ def enrich(d):
     session=d.index.date
     d['vwap']=(typical*d.Volume).groupby(session).cumsum()/d.Volume.groupby(session).cumsum().replace(0,np.nan)
     change=d.Close.diff(); up=change.clip(lower=0).ewm(alpha=1/14,adjust=False).mean(); dn=(-change.clip(upper=0)).ewm(alpha=1/14,adjust=False).mean()
-    d['rsi']=100-100/(1+up/dn.replace(0,np.nan))
+    d['rsi']=(100-100/(1+up/dn.replace(0,np.nan))).mask((dn==0)&(up>0),100).mask((dn==0)&(up==0),50)
     d['volma']=d.Volume.shift(1).rolling(20).mean()
     d['st_entry']=supertrend(d,10,3)
     d['st_exit']=supertrend(d,7,2)
@@ -100,28 +100,33 @@ def signal(d, symbol, threshold=7):
         valid=score>=threshold and tests['Supertrend 10,3'] and tests['EMA 9/21'] and tests['VWAP'] and tests['Volume 1.5x'] and structure
         results.append({'symbol':symbol,'side':side,'score':score,'max_score':8,'eligible':bool(valid),
           'close':float(r.Close),'candle':str(d.index[-1]),'tests':tests,'exit_st':int(r.st_exit),
+          'volume_source':d.attrs.get('volume_source','NSE equity'),
           'reverse_now':bool(r.st_exit==-sgn and prior.st_exit==sgn)})
     return results
 
 
-def choose_option(api,x,side,capital,max_premium=35000,max_spread=5):
-    raw=api.expiries(x['sid'],x['segment']); expiries=raw.get('data',raw)
+def _daily_expiry(session, sid, segment, day):
+    raw=session.expiries(sid,segment)
+    expiries=raw.get('data',raw)
     if isinstance(expiries,dict): expiries=expiries.get('expiry',expiries.get('data',[]))
     dates=sorted(pd.Timestamp(v).date() for v in expiries)
+    return next((v for v in dates if (v-day).days>=2),None)
+
+
+def choose_option(api,x,side,capital,max_premium=35000,max_spread=5):
     now=datetime.now(IST).date()
-    # Intraday: nearest expiry with >=2 calendar days; not necessarily monthly
-    exp=next((v for v in dates if (v-now).days>=2),None)
+    # Use cached expiry metadata where supplied. Live bid/ask is always fetched separately.
+    exp=api.nearest_expiry(x['sid'],x['segment'],now) if hasattr(api,'nearest_expiry') else _daily_expiry(api,x['sid'],x['segment'],now)
     if exp is None: return None,'No eligible expiry'
+    try: lot=int(float(x.get('lot',0) or 0))
+    except (ValueError, OverflowError, TypeError): lot=0
+    if lot<=0: return None,'Missing or invalid lot size in Dhan instrument master'
     spot,chain=parse_chain(api.chain(x['sid'],x['segment'],exp.isoformat()))
     if chain.empty: return None,'No option-chain quotes'
-    p={'delta_lo':0.4,'delta_hi':0.75,'max_spread':max_spread}
+    p={'delta_lo':0.4,'delta_hi':0.75,'max_spread':max_spread,'lot':lot,'max_ask':max_premium/lot}
     selected,_,reason=select_contract(chain,side,spot,p)
     if selected is None: return None,reason
-    lot=int(float(x.get('lot',0) or 0))
-    ask=float(selected['ask']);bid=float(selected['bid'])
-    if lot<=0 or ask<=0 or bid<=0: return None,'Invalid lot or bid/ask'
-    cost=ask*lot
-    if cost>max_premium: return None,f'One lot costs ₹{cost:,.0f} > cap ₹{max_premium:,.0f}'
+    ask,bid=float(selected['ask']),float(selected['bid'])
     return {'contract':f"{x['symbol']} {exp} {selected['strike']:g} {side}", 'expiry':exp.isoformat(),
             'strike':float(selected['strike']),'lot':lot,'premium':ask,'bid':bid,
             'delta':float(selected['delta']),'iv':float(selected['iv']),'spot':spot},''
