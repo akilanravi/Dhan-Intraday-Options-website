@@ -1,16 +1,19 @@
 """Process-shared dashboard scanner and paper writer, independent of tab widgets."""
 from types import SimpleNamespace
-from threading import RLock
+from threading import RLock, Thread, Event
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 from queue import SimpleQueue, Empty
 import time
 import pandas as pd
 import streamlit as st
-from paper_engine import PaperStore, refresh_cycle, worker_pool
+from paper_engine import PaperStore, refresh_cycle
+from swing_core import IST
 from worker_store import cloud_journal
 from scan_clock import scheduled_slot, regular_day, completed_slot
 from signal_history import collect, read_local, save_local, read_gist, save_gist, merge
 
-DASHBOARD_RUNTIME_API = 4
+DASHBOARD_RUNTIME_API = 5
 
 
 @st.cache_resource
@@ -21,6 +24,9 @@ def get_runtime(key, mode, token, gist, owner):
     items, lock = runtimes(DASHBOARD_RUNTIME_API)
     with lock:
         if key not in items:
+            for old in items.values():
+                old.stop.set()
+            items.clear()
             items[key]=Runtime(mode,token,gist,owner)
         return items[key]
 
@@ -61,6 +67,31 @@ class Runtime:
         self.history_checked=0
         self.history_future=None
         self.history_error=""
+        self.stop=Event()
+        self.executor=ThreadPoolExecutor(max_workers=4,thread_name_prefix='intraday')
+        self.background=None
+        self.bg_inputs=None
+
+    def _start_background(self, settings, lookup, token, client, params, owner, priority):
+        self.bg_inputs=(dict(settings),lookup,token,client,dict(params),owner,tuple(priority))
+        if self.background is None:
+            self.background=Thread(target=self._run_background,daemon=True,name='intraday-scheduler')
+            self.background.start()
+
+    def _run_background(self):
+        try:
+            while not self.stop.wait(1):
+                with self.lock:
+                    if self.stop.is_set():
+                        break
+                    settings,lookup,token,client,params,owner,priority=self.bg_inputs
+                    try:
+                        self.step(datetime.now(IST),settings,False,lookup,token,client,params,owner,
+                                  priority=priority,background=True)
+                    except Exception as exc:
+                        self.error=f'Background scanner unavailable: {type(exc).__name__}'
+        finally:
+            self.executor.shutdown(wait=False,cancel_futures=True)
 
     def load(self, previous_id):
         if self.mode:
@@ -98,16 +129,18 @@ class Runtime:
         finally:
             self.load_future=None
 
-    def step(self, clock, settings, request, lookup, token, client, params, owner, priority=()):
+    def step(self, clock, settings, request, lookup, token, client, params, owner, priority=(), background=False):
         with self.lock:
             # Any connected viewer can drive scheduling. A single lock and future
             # still serialize journal writes. The controller only owns policy.
-            if (request and not self.mode) or time.monotonic()-getattr(self,'owner_seen',-1e6)>90:
+            if not background and ((request and not self.mode) or time.monotonic()-getattr(self,'owner_seen',-1e6)>90):
                 self.owner=owner
             controller=self.owner==owner
-            if controller:
+            if controller and not background:
                 self.owner_seen=time.monotonic()
                 self.current_inputs=(token,client,params.copy(),tuple(priority))
+                if not self.mode:
+                    self._start_background(settings, lookup, token, client, params, owner, priority)
             if request and not self.mode:
                 if self.future is not None:
                     self.notice='Scan already running. Results appear as symbols finish.'
@@ -117,7 +150,7 @@ class Runtime:
             if self.load_future is not None and self.load_future.done():self.finish_load()
             if self.load_future is None and self.future is None and (self.mode or not self.loaded) and (request or time.monotonic()-self.checked>=(5 if self.mode and scheduled_slot(clock,settings) is not None and (self.slot!=completed_slot(clock) or self.cloud_status.get('phase')=='preview') else 15)):
                 self.checked=time.monotonic()
-                self.load_future=worker_pool().submit(self.load,self.cloud_status.get('snapshot_id',''))
+                self.load_future=self.executor.submit(self.load,self.cloud_status.get('snapshot_id',''))
             while True:
                 try:packet=self.queue.get_nowait()
                 except Empty:break
@@ -157,7 +190,7 @@ class Runtime:
                     if self.github and self.store.gist:
                         save_gist(self.github,self.store.gist,snapshot)
                     return snapshot
-                self.history_future=worker_pool().submit(persist)
+                self.history_future=self.executor.submit(persist)
             slot=scheduled_slot(clock,settings)
             grace=regular_day(clock,settings) and (9,20)<=(clock.hour,clock.minute)<(15,35) and slot is None
             if not self.mode and self.future is None and self.load_future is None and not grace:
@@ -179,9 +212,11 @@ class Runtime:
                     ordered=list(dict.fromkeys([*(s for s in first if s in lookup),*lookup]))
                     self.policy=policy.copy()
                     allowed=slot is not None and not historical
-                    self.future=worker_pool().submit(refresh_cycle,t,c,lookup,ordered,self.journal,
+                    self.future=self.executor.submit(refresh_cycle,t,c,lookup,ordered,self.journal,
                         **policy,store=self.store,dirty=self.dirty,progress=self.queue,journal_ready=self.loaded,
                         slot=slot,allow_trades=allowed)
+            if background:
+                return None
             partial=self.future is not None and bool(self.preview_rows)
             rows=[r for pair in self.preview_rows.values() for r in pair] if partial else self.rows
             candles=self.preview_candles.copy() if partial else self.candles

@@ -34,7 +34,7 @@ st.title('DHAN QUANT · INTRADAY OPTIONS TERMINAL')
 st.caption('Dhan only · 5-minute completed candles · CE/PE · no Telegram · no real broker orders')
 st.caption('Build 5.3 · Live signal timestamps · No daily paper-entry cap')
 
-RUNTIME_API_REQUIRED=4
+RUNTIME_API_REQUIRED=5
 UPDATE_NOTE=('Scanner files are out of sync. Replace the project files together from the same ZIP '
              'in one commit, then use Manage app → Reboot app. Keep your existing secrets.')
 if getattr(scanner_runtime,'DASHBOARD_RUNTIME_API',None)!=RUNTIME_API_REQUIRED:
@@ -103,7 +103,7 @@ def dashboard():
     elif manual and grace and not worker_mode:st.caption('Waiting briefly for Dhan to publish the new closed candle.')
     state=('Scanning in background' if data.future is not None else
            data.status.get('state','Waiting for worker') if worker_mode else
-           'Automatic 5-minute scans on' if scheduled_slot(clock,settings) is not None or grace else
+           'Background 5-minute scans on' if scheduled_slot(clock,settings) is not None or grace else
            'Waiting for the next regular NSE session / candle')
     st.caption(f"{state} · Full universe: {len(lookup)} NSE F&O underlyings including indices.")
     end=candle_close(data.slot) if data.slot is not None else '—'
