@@ -34,9 +34,9 @@ h1{background:linear-gradient(90deg,#6ee7ff,#b69bff,#ff76c7);-webkit-background-
 
 st.title('DHAN QUANT · INTRADAY OPTIONS TERMINAL')
 st.caption('Dhan only · 5-minute completed candles · CE/PE · no Telegram · no real broker orders')
-st.caption('Build 5.4 · Live signal timestamps · 15-minute opening breakouts')
+st.caption('Build 5.5 · Opening 15-minute body · 5-minute breakout checks')
 
-RUNTIME_API_REQUIRED=5
+RUNTIME_API_REQUIRED=6
 UPDATE_NOTE=('Scanner files are out of sync. Replace the project files together from the same ZIP '
              'in one commit, then use Manage app → Reboot app. Keep your existing secrets.')
 if getattr(scanner_runtime,'DASHBOARD_RUNTIME_API',None)!=RUNTIME_API_REQUIRED:
@@ -405,11 +405,11 @@ def render_dashboard(tab,live):
             api=DhanAPI(token,client)
             with api.session:
                 return choose_option(api,lookup[symbol],side,capital,max_premium=cap)
-        render_breakouts(r,lookup,CHECKS,now,visible_slot,regular_day(now,settings),quote_stock)
+        render_breakouts(live.breakout_rows,lookup,CHECKS,now,visible_slot,regular_day(now,settings),quote_stock)
 
 PAGES=(
     '1 · Market scanner','2 · Eligible signal cards','3 · Trade analysis',
-    '4 · Paper trading','5 · Conditions','6 · Trade Decision','7 · Call / Put Backtest','8 · ⚡ Breakout (15m)',
+    '4 · Paper trading','5 · Conditions','6 · Trade Decision','7 · Call / Put Backtest','8 · ⚡ Breakout (5m)',
 )
 
 

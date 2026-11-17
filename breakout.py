@@ -1,72 +1,61 @@
-"""15-minute opening-range events built from the scanner's completed 5-minute data."""
+"""Opening-body cross events from completed Dhan 5-minute candles."""
 from math import isfinite
 
 import pandas as pd
 
 IST = 'Asia/Kolkata'
 FIVE = pd.Timedelta(minutes=5)
-FIFTEEN = 3 * FIVE
 OHLC = ('Open', 'High', 'Low', 'Close')
 
 
 def scan_opening_breakouts(frame, check_at_close):
-    """Return one session's events and 15-minute data coverage.
+    """Fix 09:15 open and 09:30 close, then detect subsequent 5m close crosses.
 
-    Input is enriched, sorted, unique Dhan data capped at the scanner's
-    published bar. check_at_close gets only the prefix ending at the event.
+    Frame is sorted and capped at the scanner's published completed bar.
+    The checklist callback sees only history ending at each cross.
     """
-    result = {'session': None, 'opening_ready': False, 'last_15m_close': None, 'events': []}
+    result = {'session': None, 'opening_ready': False, 'last_5m_close': None, 'events': []}
     if frame.empty:
         return result
     if frame.index.tz is None:
         raise ValueError('Breakout candles must carry a timezone')
-    latest = frame.index[-1].tz_convert(IST)
-    session = latest.normalize()
-    result['session'] = session.date().isoformat()
-    opening = session + pd.Timedelta(hours=9, minutes=15)
-    end = session + pd.Timedelta(hours=15, minutes=30)
-    ready = min(latest + FIVE, end)
-    if ready < opening + FIFTEEN:
+    last = frame.index[-1].tz_convert(IST)
+    day = last.normalize()
+    result['session'] = day.date().isoformat()
+    opening = day + pd.Timedelta(hours=9, minutes=15)
+    ready = min(last, day + pd.Timedelta(hours=15, minutes=25))
+    starts = pd.date_range(opening, ready, freq=FIVE)
+    pos = frame.index.get_indexer(starts)
+    if len(pos) < 3 or (pos[:3] < 0).any():
         return result
-
-    starts = pd.date_range(opening, ready - FIFTEEN, freq=FIFTEEN)
-    wanted = pd.date_range(opening, periods=3*len(starts), freq=FIVE)
-    positions = frame.index.get_indexer(wanted).reshape(-1, 3)
-    valid = (positions >= 0).all(axis=1)
-    columns = frame.loc[:, [*OHLC, 'Volume']].to_numpy(dtype=float)
-    bins = {}
-    for start, group in zip(starts[valid], positions[valid]):
-        bars = columns[group]
-        if not all(isfinite(x) and x > 0 for x in bars[:, :4].ravel()):
-            continue
-        vol = bars[:, 4]
-        bins[start] = ({
-            'open': float(bars[0, 0]), 'high': float(max(bars[:, 1])),
-            'low': float(min(bars[:, 2])), 'close': float(bars[-1, 3]),
-            'volume': float(sum(vol)) if all(isfinite(v) and v >= 0 for v in vol) else None,
-        }, int(group[-1]))
-
-    if opening not in bins:
+    data = frame.loc[:, [*OHLC,'Volume']].to_numpy(dtype=float)
+    if not all(isfinite(v) and v > 0 for v in data[pos[:3], :4].ravel()):
         return result
+    ref_open, ref_close = float(data[pos[0], 0]), float(data[pos[2], 3])
+    upper, lower = max(ref_open,ref_close), min(ref_open,ref_close)
     result['opening_ready'] = True
-    result['last_15m_close'] = (max(bins) + FIFTEEN).isoformat()
-    opening_bar, _ = bins[opening]
-    hi, lo = opening_bar['high'], opening_bar['low']
-    for start, (bar, final_pos) in bins.items():
-        if start == opening:
+    for i in range(3,len(pos)):
+        if pos[i-1] < 0 or pos[i] < 0:
             continue
-        o, c = bar['open'], bar['close']
-        if o <= hi < c:
-            side, level = 'CE', hi
-        elif o >= lo > c:
-            side, level = 'PE', lo
+        previous = float(data[pos[i-1],3])
+        o,h,l,c,v = (float(x) for x in data[pos[i]])
+        if not all(isfinite(x) and x > 0 for x in (previous,o,h,l,c)):
+            continue
+        start = starts[i]
+        end = start + FIVE
+        result['last_5m_close'] = end.isoformat()
+        if previous <= upper < c:
+            side, level = 'CE', upper
+        elif previous >= lower > c:
+            side, level = 'PE', lower
         else:
             continue
-        check = check_at_close(frame.iloc[:final_pos+1], side)
         result['events'].append({
-            **bar, **check, 'side': side, 'level': level,
-            'opening_high': hi, 'opening_low': lo, 'session_open': opening_bar['open'],
-            'move_points': c - level, 'move_pct': 100 * (c - level) / level,
-            'start': start.isoformat(), 'end': (start + FIFTEEN).isoformat(),
+            'open':o, 'high':h, 'low':l, 'close':c, 'volume':v if isfinite(v) and v >= 0 else None,
+            **check_at_close(frame.iloc[:pos[i]+1], side),
+            'side':side, 'level':level, 'upper':upper, 'lower':lower,
+            'reference_open':ref_open, 'reference_close':ref_close, 'previous_close':previous,
+            'move_points':c - level, 'move_pct':100 * (c - level) / level,
+            'start':start.isoformat(), 'end':end.isoformat(),
         })
     return result

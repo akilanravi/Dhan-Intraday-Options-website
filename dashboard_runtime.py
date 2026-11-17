@@ -13,7 +13,7 @@ from worker_store import cloud_journal
 from scan_clock import scheduled_slot, regular_day, completed_slot
 from signal_history import collect, read_local, save_local, read_gist, save_gist, merge
 
-DASHBOARD_RUNTIME_API = 5
+DASHBOARD_RUNTIME_API = 6
 
 
 @st.cache_resource
@@ -50,6 +50,8 @@ class Runtime:
         self.progress=None
         self.preview_rows={}
         self.preview_candles={}
+        self.breakout_day=''
+        self.breakout_by_symbol={}
         self.complete_coverage=False
         self.notice=''
         self.manual_requested=False
@@ -93,6 +95,20 @@ class Runtime:
         finally:
             self.executor.shutdown(wait=False,cancel_futures=True)
 
+    def remember_breakouts(self, rows):
+        # Keep previously scanned symbols visible while a new scan is in
+        # progress or a symbol temporarily fails to return a fresh bar.
+        for row in rows:
+            packet=row.get('opening_breakout_5m')
+            if not packet or not packet['session'] or packet['session']<self.breakout_day:
+                continue
+            if packet['session']>self.breakout_day:
+                self.breakout_day=packet['session']
+                self.breakout_by_symbol={}
+            previous=self.breakout_by_symbol.get(row['symbol'])
+            if previous is None or row['candle']>=previous['candle']:
+                self.breakout_by_symbol[row['symbol']]=row
+
     def load(self, previous_id):
         if self.mode:
             if self.cloud is None:
@@ -118,6 +134,7 @@ class Runtime:
             if self.mode and status is not None:
                 if snap is not None:
                     self.rows,self.candles,slot=snap
+                    self.remember_breakouts(self.rows)
                     self.slot=pd.Timestamp(slot) if slot else None
                 self.cloud_status=status
                 self.notes=status.get('notes',[])
@@ -160,6 +177,7 @@ class Runtime:
                     if rows:
                         symbol=packet[2]
                         self.preview_rows[symbol]=rows
+                        self.remember_breakouts(rows)
                         self.preview_candles[symbol]=candles
                         self.signal_history=collect(self.signal_history,rows,self.requested_slot)
             if self.future is not None and self.future.done():
@@ -168,6 +186,7 @@ class Runtime:
                     self.complete_coverage=len({r['symbol'] for r in rows})==len(lookup) and bool(rows)
                     if rows or not self.rows:
                         self.rows,self.candles,self.slot=rows,candles,self.requested_slot
+                        self.remember_breakouts(rows)
                     else:
                         self.notes.insert(0,'No new rows published. Showing the previous snapshot.')
                     if self.loaded:self.journal=journal
@@ -221,6 +240,7 @@ class Runtime:
             rows=[r for pair in self.preview_rows.values() for r in pair] if partial else self.rows
             candles=self.preview_candles.copy() if partial else self.candles
             return SimpleNamespace(rows=rows,candles=candles,journal=self.journal,notes=self.notes,
+                breakout_rows=list(self.breakout_by_symbol.values()),
                 partial=partial,preview_slot=self.requested_slot if partial else None,notice=self.notice,
                 stamp=self.stamp,slot=self.slot,progress=self.progress,future=self.future,error=self.error or self.history_error,
                 status=self.cloud_status,gist=self.store.gist,controller=controller,signal_history=self.signal_history,

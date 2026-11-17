@@ -262,7 +262,7 @@ def refresh_cycle(token,client,lookup,selected,j,threshold,capital,cap,stop,targ
             matching=next(r for r in signal(prefix,symbol,threshold) if r['side']==side)
             return {k:matching[k] for k in ('score','max_score','eligible','tests')}
         if symbol in selected_set and x['instrument']!='INDEX':
-            rows[0]['opening_breakout_15m']=scan_opening_breakouts(frame,check_at_close)
+            rows[0]['opening_breakout_5m']=scan_opening_breakouts(frame,check_at_close)
         return frame, rows
 
     delayed=[]
