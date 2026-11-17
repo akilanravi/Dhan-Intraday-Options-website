@@ -13,6 +13,8 @@ from paper_engine import universe, fresh_candle
 import dashboard_runtime as scanner_runtime
 from scan_clock import BAR, timestamp, scheduled_slot, regular_day, completed_slot, write_window
 from paper_report import performance_by_symbol
+from breakout_view import render_breakouts
+from intraday import choose_option
 from signal_history import times_for
 from dashboard_auth import require_password, is_authenticated, read_secret
 
@@ -32,7 +34,7 @@ h1{background:linear-gradient(90deg,#6ee7ff,#b69bff,#ff76c7);-webkit-background-
 
 st.title('DHAN QUANT · INTRADAY OPTIONS TERMINAL')
 st.caption('Dhan only · 5-minute completed candles · CE/PE · no Telegram · no real broker orders')
-st.caption('Build 5.3 · Live signal timestamps · No daily paper-entry cap')
+st.caption('Build 5.4 · Live signal timestamps · 15-minute opening breakouts')
 
 RUNTIME_API_REQUIRED=5
 UPDATE_NOTE=('Scanner files are out of sync. Replace the project files together from the same ZIP '
@@ -218,7 +220,7 @@ def render_dashboard(tab,live):
     table_live=regular_day(now,settings) and write_window(now) and visible_slot is not None and visible_slot==completed_slot(now)
     if live.partial and tab != 3:
         st.caption('Partial scan. Results update as Dhan responds. Paper entries are evaluated after the batch, not from this preview.')
-    if tab != 3 and r and not table_live:
+    if tab not in (3,7) and r and not table_live:
         st.caption('Showing the last available snapshot. These are not current live-entry signals.')
     if tab == 0:
         m1,m2,m3,m4=st.columns(4)
@@ -398,10 +400,16 @@ def render_dashboard(tab,live):
                                        'Supertrend (7,2) reversal or opposing eligible signal.',
                                        'End-of-day exit checks start at 15:20 IST; a valid bid is needed.'])
 
+    if tab == 7:
+        def quote_stock(symbol, side):
+            api=DhanAPI(token,client)
+            with api.session:
+                return choose_option(api,lookup[symbol],side,capital,max_premium=cap)
+        render_breakouts(r,lookup,CHECKS,now,visible_slot,regular_day(now,settings),quote_stock)
 
 PAGES=(
     '1 · Market scanner','2 · Eligible signal cards','3 · Trade analysis',
-    '4 · Paper trading','5 · Conditions','6 · Trade Decision','7 · Call / Put Backtest',
+    '4 · Paper trading','5 · Conditions','6 · Trade Decision','7 · Call / Put Backtest','8 · ⚡ Breakout (15m)',
 )
 
 
@@ -411,7 +419,7 @@ def live_view(page):
     if not is_authenticated():
         st.rerun()
     data=dashboard()
-    if page<6:
+    if page!=6:
         render_dashboard(page,data)
 
 

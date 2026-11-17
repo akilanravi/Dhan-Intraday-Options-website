@@ -9,6 +9,7 @@ import pandas as pd
 import requests
 import streamlit as st
 from intraday import intraday_candles,enrich,signal,choose_option,_daily_expiry
+from breakout import scan_opening_breakouts
 from swing_core import DhanAPI,load_universe,IST
 from scan_clock import BAR, fresh_candle, write_window, entry_window
 
@@ -255,7 +256,14 @@ def refresh_cycle(token,client,lookup,selected,j,threshold,capital,cap,stop,targ
             raw=raw.copy()
             raw.attrs['volume_source']='Index volume unavailable' if raw.Volume.tail(21).sum()<=0 else 'Dhan index'
         frame=enrich(raw)
-        return frame, signal(frame,symbol,threshold)
+        rows=signal(frame,symbol,threshold)
+        # Scanner-only metadata. The existing paper eligibility is unchanged.
+        def check_at_close(prefix, side):
+            matching=next(r for r in signal(prefix,symbol,threshold) if r['side']==side)
+            return {k:matching[k] for k in ('score','max_score','eligible','tests')}
+        if symbol in selected_set and x['instrument']!='INDEX':
+            rows[0]['opening_breakout_15m']=scan_opening_breakouts(frame,check_at_close)
+        return frame, rows
 
     delayed=[]
     next_preview=12
