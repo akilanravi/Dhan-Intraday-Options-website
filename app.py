@@ -1,6 +1,7 @@
 """Dhan Intraday Options. Five-minute, full-universe paper-only dashboard."""
 import hashlib
 import html
+from pathlib import Path
 import os
 import uuid
 from datetime import datetime
@@ -20,21 +21,16 @@ from dashboard_auth import require_password, is_authenticated, read_secret
 
 st.set_page_config(page_title='DHAN QUANT · INTRADAY',layout='wide',page_icon='📈')
 require_password('Dhan Intraday')
-st.markdown('''<style>
-.stApp{background:linear-gradient(145deg,#060b17,#101d35);color:#e9f3ff}
-h2,h3{color:#eaf4ff!important}p,label,.stMarkdown{color:#d6e6ff}
-h1{background:linear-gradient(90deg,#6ee7ff,#b69bff,#ff76c7);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
-[data-testid="stMetric"]{background:#10223c;border:1px solid #2b4769;border-radius:16px;padding:14px}
-[data-testid="stMetricValue"]{color:#4be4ff}
-.stButton button{background:linear-gradient(100deg,#1459d9,#8742c6);color:white;border-radius:11px}
-[data-testid="stDataFrame"]{border:1px solid #294261;border-radius:12px}
-/* Keep Streamlit’s retained widgets at full contrast while replacements render. */
-[data-stale="true"], .stale-element {opacity:1!important;transition:none!important;animation:none!important}
-</style>''',unsafe_allow_html=True)
-
-st.title('DHAN QUANT · INTRADAY OPTIONS TERMINAL')
-st.caption('Dhan only · 5-minute completed candles · CE/PE · no Telegram · no real broker orders')
-st.caption('Build 5.5 · Opening 15-minute body · 5-minute breakout checks')
+st.markdown('''<style>{css}</style>
+<div class="dhan-banner dhan-intraday">
+  <div class="dhan-grain" aria-hidden="true"></div>
+  <div class="dhan-banner-content">
+    <div class="dhan-brand">Five-minute F&O scanner</div>
+    <h1>Dhan Intraday Options</h1>
+    <p>Completed 5-minute candles <span aria-hidden="true">·</span> Paper trading</p>
+  </div>
+</div>'''.replace('{css}', Path(__file__).with_name('dashboard_theme.css').read_text(encoding='utf-8')),
+            unsafe_allow_html=True)
 
 RUNTIME_API_REQUIRED=6
 UPDATE_NOTE=('Scanner files are out of sync. Replace the project files together from the same ZIP '
@@ -98,7 +94,8 @@ def dashboard():
     clock=datetime.now(IST)
     configured_market=regular_day(clock,settings)
     grace=configured_market and (9,20)<=(clock.hour,clock.minute)<(15,35) and scheduled_slot(clock,settings) is None
-    manual=st.button('Pull latest worker results' if worker_mode else '🔄 REFRESH NOW',
+    status_col, refresh_col = st.columns([4, 1], vertical_alignment='center')
+    manual=refresh_col.button('Pull latest worker results' if worker_mode else 'Refresh now',
                      type='primary')
     data=runtime.step(clock,settings,manual,lookup,token,client,params,ss.runtime_owner,priority=priority)
     if data.notice:st.caption(data.notice)
@@ -107,14 +104,14 @@ def dashboard():
            data.status.get('state','Waiting for worker') if worker_mode else
            'Background 5-minute scans on' if scheduled_slot(clock,settings) is not None or grace else
            'Waiting for the next regular NSE session / candle')
-    st.caption(f"{state} · Full universe: {len(lookup)} NSE F&O underlyings including indices.")
+    status_col.caption(f"{state} · Full universe: {len(lookup)} NSE F&O underlyings including indices.")
     end=candle_close(data.slot) if data.slot is not None else '—'
     if scheduled_slot(clock,settings) is not None:
         st.caption(f'Latest expected candle close: {candle_close(completed_slot(clock))}')
     if data.partial and data.preview_slot is not None:
         st.caption(f'Receiving candle closed at {candle_close(data.preview_slot)}. Missing symbols are not filled with older data.')
     checked=pd.Timestamp(data.stamp).tz_convert(IST).strftime('%d %b %H:%M:%S IST') if data.stamp else '—'
-    st.caption(f'Published candle close: {end} · Last snapshot update: {checked}')
+    st.markdown(f'**Published candle** {end}  ·  **Snapshot updated** {checked}')
     if worker_mode and data.status.get('phase')=='preview':
         st.caption('Live worker preview. Signals are available before paper checks and full chart history finish.')
     if data.progress is not None:
@@ -264,10 +261,9 @@ def render_dashboard(tab,live):
             for col,x in zip(cols,eligible[i:i+3]):
                 with col:
                     label='Bullish' if x['side']=='CE' else 'Bearish'
-                    border=BIAS_COLORS[label][0]
-                    st.markdown(f'''<div style="background:#10223a;border:2px solid {border};border-radius:17px;padding:18px;color:#eaf4ff">
-                    <h3 style="color:{border}!important">{html.escape(x['symbol'])} · {x['side']} · {label}</h3>
-                    <h2 style="color:#5de7ff!important">{x['score']}/8</h2><p>Underlying close ₹{x['close']:,.2f}</p>
+                    st.markdown(f'''<div class="signal-card {x['side'].lower()}">
+                    <div class="signal-name">{html.escape(x['symbol'])} <span class="signal-pill">{x['side']} · {label}</span></div>
+                    <div class="signal-score">{x['score']}<small> / 8</small></div><p>Underlying close <b>₹{x['close']:,.2f}</b></p>
                     <small>{candle_range(x['candle'])}</small>
                     <p>Qualified closes (IST): {html.escape(times_for(history,x) or '—')}</p>
                     <small>{html.escape(('Detected in '+str(x['detect_seconds'])+' s · '+('Within 60 s' if x['detect_seconds']<=60 else 'Over 60 s')) if x.get('detect_seconds') is not None else 'Detection time unavailable')}</small></div>''',unsafe_allow_html=True)
@@ -304,7 +300,7 @@ def render_dashboard(tab,live):
                         name=label,increasing_line_color=color,decreasing_line_color=color))
                 for name,color in [('ema9','#fbd34d'),('ema21','#f67ea4'),('vwap','#5be3ff')]:
                     fig.add_trace(go.Scatter(x=d.index,y=d[name],name=name.upper(),line={'color':color,'width':1.5}))
-                fig.update_layout(template='plotly_dark',paper_bgcolor='#0b1424',plot_bgcolor='#0b1424',height=520,xaxis_rangeslider_visible=False,uirevision=symbol)
+                fig.update_layout(template='plotly_dark',paper_bgcolor='#101722',plot_bgcolor='#101722',height=520,xaxis_rangeslider_visible=False,uirevision=symbol)
                 st.plotly_chart(fig,width='stretch')
             except ImportError:st.line_chart(d[['Close','ema9','ema21','vwap']])
             st.caption(LEGEND + ' · Candles compare Close to Open. Supertrend cells show the indicator’s own direction.')
@@ -408,8 +404,8 @@ def render_dashboard(tab,live):
         render_breakouts(live.breakout_rows,lookup,CHECKS,now,visible_slot,regular_day(now,settings),quote_stock)
 
 PAGES=(
-    '1 · Market scanner','2 · Eligible signal cards','3 · Trade analysis',
-    '4 · Paper trading','5 · Conditions','6 · Trade Decision','7 · Call / Put Backtest','8 · ⚡ Breakout (5m)',
+    'Scanner','CE / PE Signals','Charts',
+    'Paper Trading','Conditions','Trade Decision','Backtest','5m Breakouts',
 )
 
 
@@ -423,7 +419,7 @@ def live_view(page):
         render_dashboard(page,data)
 
 
-page=st.radio('Dashboard view',PAGES,horizontal=True,key='intraday_view_52',label_visibility='collapsed')
+page=st.segmented_control('Dashboard view',PAGES,selection_mode='single',default=PAGES[0],required=True,wrap=True,key='intraday_view_52',label_visibility='collapsed')
 index=PAGES.index(page)
 live_view(index)
 if index==6:
