@@ -1,6 +1,10 @@
 [theme]
 base = "dark"
-primaryColor = "#5BE3FF"
-backgroundColor = "#080F1D"
-secondaryBackgroundColor = "#14243A"
-textColor = "#EAF4FF"
+primaryColor = "#65dfd1"
+backgroundColor = "#0a1019"
+secondaryBackgroundColor = "#151f2d"
+textColor = "#edf3fb"
+
+[server]
+# Preserve short reconnects after minimize or device lock.
+disconnectedSessionTTL = 7500
